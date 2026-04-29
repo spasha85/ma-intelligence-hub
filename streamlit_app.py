@@ -399,38 +399,102 @@ with tab6:
                 st.error(f"Error: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 7 — AI ASSISTANT
+# TAB 7 — AI CHATBOT
 # ══════════════════════════════════════════════════════════════════════════════
 with tab7:
-    st.markdown('<div class="section-header">AI Assistant</div>', unsafe_allow_html=True)
-    st.caption("Note: AI answers are based on general MA knowledge. Use other tabs for live data.")
-    quick_qs = [
-        "Which plans should I target first for consulting and why?",
-        "What are the biggest compliance risk patterns in the CAP data?",
-        "Which high-weight measures show the most room for improvement?",
-        "How do low performer plans compare to 4-star plans on clinical measures?",
-        "What consulting services would most benefit plans below 3.0 stars?",
-    ]
-    cols = st.columns(len(quick_qs))
-    for i, q in enumerate(quick_qs):
-        if cols[i].button(q, use_container_width=True, key=f"q{i}"):
-            st.session_state.ai_q = q
+    st.markdown('<div class="section-header">MA Consulting AI Chatbot</div>', unsafe_allow_html=True)
+    st.caption("Powered by mistral-large2 · Ask anything about MA strategy, Star Ratings, CAP, and consulting opportunities")
 
-    question = st.text_area("Ask your own question", height=80,
-                             value=st.session_state.get("ai_q",""),
-                             placeholder="e.g. Which plans in Florida have both low stars and CAP issues?")
-    if st.button("Ask ↗", type="primary"):
-        if question:
-            st.session_state.pop("ai_q", None)
+    SYSTEM_PROMPT = """You are an expert Medicare Advantage consulting analyst for Sadaf,
+    a Lead BI Developer building an independent consulting firm targeting small and regional MA plans.
+
+    You have deep knowledge of:
+    - CMS Star Ratings (Part C & D measures, weights 1-5, cut points)
+    - Risk Adjustment and RAF scores
+    - CAP enforcement actions and compliance remediation
+    - Low performer identification and improvement strategies
+    - Medication adherence measures (D08, D09, D10 each weight 3)
+    - Clinical quality: HEDIS, CAHPS, HOS measures
+    - 2027 changes: new measures (Care for Older Adults FSA, COB, Poly-ACH); removed (Pain Assessment, Med Rec, MTM CMR)
+    - Consulting strategy for small/regional MA plans
+
+    Database has 769 MA contracts with 2026 Star Ratings, 503 CAP enforcement actions,
+    4 low performer plans, and enrollment from MA Contract Directory.
+
+    Opportunity scoring: CAP=+30, Low performer=+25, Stars<3.0=+20, Stars 3.0-3.4=+10, CAI flag=+15.
+
+    Be concise, strategic, and actionable. Use bullet points when listing items."""
+
+    # Quick question buttons
+    st.write("**Quick questions:**")
+    quick_qs = [
+        "Which plans should I target first?",
+        "What does a CAP issue mean for a plan?",
+        "Which 2027 measures have the highest weight?",
+        "How do I pitch my services to a low performer?",
+        "What changed in 2027 Star Ratings?",
+        "How is the opportunity score calculated?",
+        "What is a CAI flag?",
+        "How does medication adherence affect stars?",
+        "What is risk adjustment consulting?",
+    ]
+    cols = st.columns(3)
+    for i, q in enumerate(quick_qs):
+        if cols[i % 3].button(q, use_container_width=True, key=f"cq{i}"):
+            st.session_state.setdefault("chat_messages", [])
+            if not st.session_state.chat_messages or st.session_state.chat_messages[-1]["content"] != q:
+                st.session_state.chat_messages.append({"role": "user", "content": q})
+                st.session_state.chat_run = True
+
+    st.divider()
+
+    # Init chat history
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    # Display chat history
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat input box
+    if prompt := st.chat_input("Ask about MA consulting, Star Ratings, CAP issues, measures..."):
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        st.session_state.chat_run = True
+
+    # Generate AI response
+    if st.session_state.get("chat_run") and st.session_state.chat_messages:
+        st.session_state.chat_run = False
+        with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
+                    import json
+                    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                    for m in st.session_state.chat_messages[-10:]:
+                        messages.append({"role": m["role"], "content": m["content"]})
+
+                    messages_str = json.dumps(messages).replace("\\", "\\\\").replace("'", "\\'")
+
                     conn = get_connection()
                     cur = conn.cursor()
-                    prompt = f"""You are an expert Medicare Advantage consulting analyst for Sadaf.
-                    Answer concisely and actionably: {question}"""
-                    p = prompt.replace("\\","\\\\").replace("'","\\'")
-                    cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{p}') AS ANSWER")
-                    result = cur.fetchone()[0]
-                    st.markdown(result)
+                    cur.execute(f"""
+                        SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{messages_str}') AS ANSWER
+                    """)
+                    raw = cur.fetchone()[0]
+                    try:
+                        parsed = json.loads(raw)
+                        answer = parsed["choices"][0]["message"]["content"]
+                    except Exception:
+                        answer = raw
+                    st.markdown(answer)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": answer})
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+    # Clear button
+    if st.session_state.get("chat_messages"):
+        if st.button("🗑️ Clear conversation", key="clear_chat"):
+            st.session_state.chat_messages = []
+            st.rerun()
