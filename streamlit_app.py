@@ -659,18 +659,24 @@ Question: """
             WHERE MBR_CNT < 150000
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITEDHEALTHCARE%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE SHIELD%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HEALTH CARE SERVICE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HCSC%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
-            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%DEVOTED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%OSCAR%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BRIGHT HEALTH%'
             ORDER BY OPPORTUNITY_SCORE DESC LIMIT 20""",
 
         "Small plans with CAP issues — show contact details": f"""
@@ -733,7 +739,14 @@ Question: """
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
             AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE SHIELD%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HEALTH CARE SERVICE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
             ORDER BY TRY_TO_DECIMAL(D08_STARS) ASC NULLS LAST LIMIT 30""",
 
         "Independent plans in California with low stars": f"""
@@ -800,6 +813,11 @@ Question: """
                 with st.spinner("Querying your Snowflake data..."):
                     try:
                         cur = get_cursor()
+
+                        EXPLAIN_PROMPT = """You are Sadaf's MA consulting analyst. Sadaf targets ONLY small independent plans.
+RULE: Filter out Humana, United, Aetna, CVS, Centene, Molina, Anthem, BCBS, Blue Cross, Blue Shield, Kaiser, Cigna, WellCare, Elevance.
+For your response list only small/independent plans with:
+Contract ID, Plan Name, State, Enrollment, Stars, Contact Name, Phone, Email, why they need help, cold outreach pitch."""
 
                         # Check if it is a quick question with pre-built SQL
                         if last_q in QUICK_SQL:
