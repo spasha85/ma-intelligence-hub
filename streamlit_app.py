@@ -16,6 +16,7 @@ st.markdown("""
 
 st.title("★ MA Intelligence Hub")
 st.caption("Star Ratings · CAP Enforcement · Low Performers · Measure Performance · Enrollment · Contract Directory")
+st.markdown("<div style='text-align:right; font-size:11px; color:#999; margin-top:-10px;'>Built by <b>Sadaf Pasha</b></div>", unsafe_allow_html=True)
 
 # ── CONNECTION ────────────────────────────────────────────────────────────────
 @st.cache_resource
@@ -398,26 +399,53 @@ with tab5:
                 if measure_view == "Key Measures Summary":
                     q = f"""{BASE_CTE} SELECT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
                                STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT, OVERALL_STARS,
-                               C01_DATA,C01_STARS,C01_WEIGHT, C02_DATA,C02_STARS,C02_WEIGHT,
-                               C03_DATA,C03_STARS,C03_WEIGHT, C04_DATA,C04_STARS,C04_WEIGHT,
-                               C05_DATA,C05_STARS,C05_WEIGHT, C12_DATA,C12_STARS,C12_WEIGHT,
-                               C14_DATA,C14_STARS,C14_WEIGHT, C18_DATA,C18_STARS,C18_WEIGHT,
-                               D08_DATA,D08_STARS,D08_WEIGHT, D09_DATA,D09_STARS,D09_WEIGHT,
-                               D10_DATA,D10_STARS,D10_WEIGHT
+                               C01_DATA AS "C01: Breast Cancer Screening [Data]",
+                               C01_STARS AS "C01: Breast Cancer Screening [Stars]",
+                               C01_WEIGHT AS "C01 Weight",
+                               C02_DATA AS "C02: Colorectal Cancer Screening [Data]",
+                               C02_STARS AS "C02: Colorectal Cancer Screening [Stars]",
+                               C02_WEIGHT AS "C02 Weight",
+                               C03_DATA AS "C03: Annual Flu Vaccine [Data]",
+                               C03_STARS AS "C03: Annual Flu Vaccine [Stars]",
+                               C03_WEIGHT AS "C03 Weight",
+                               C04_DATA AS "C04: Improving Physical Health [Data]",
+                               C04_STARS AS "C04: Improving Physical Health [Stars]",
+                               C04_WEIGHT AS "C04 Weight",
+                               C05_DATA AS "C05: Improving Mental Health [Data]",
+                               C05_STARS AS "C05: Improving Mental Health [Stars]",
+                               C05_WEIGHT AS "C05 Weight",
+                               C12_DATA AS "C12: Blood Sugar Controlled [Data]",
+                               C12_STARS AS "C12: Blood Sugar Controlled [Stars]",
+                               C12_WEIGHT AS "C12 Weight",
+                               C14_DATA AS "C14: Controlling Blood Pressure [Data]",
+                               C14_STARS AS "C14: Controlling Blood Pressure [Stars]",
+                               C14_WEIGHT AS "C14 Weight",
+                               C18_DATA AS "C18: Plan All-Cause Readmissions [Data]",
+                               C18_STARS AS "C18: Plan All-Cause Readmissions [Stars]",
+                               C18_WEIGHT AS "C18 Weight",
+                               D08_DATA AS "D08: Med Adherence Diabetes [Data]",
+                               D08_STARS AS "D08: Med Adherence Diabetes [Stars]",
+                               D08_WEIGHT AS "D08 Weight",
+                               D09_DATA AS "D09: Med Adherence Hypertension [Data]",
+                               D09_STARS AS "D09: Med Adherence Hypertension [Stars]",
+                               D09_WEIGHT AS "D09 Weight",
+                               D10_DATA AS "D10: Med Adherence Cholesterol [Data]",
+                               D10_STARS AS "D10: Med Adherence Cholesterol [Stars]",
+                               D10_WEIGHT AS "D10 Weight"
                         FROM BASE WHERE 1=1 {fc} {cc}
                         ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC LIMIT 200"""
                 elif measure_view == "Weak Measures (Stars < 3)":
                     q = f"""{BASE_CTE} SELECT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
                                STATE, PLAN_TYPE, OVERALL_STARS,
-                               CASE WHEN TRY_TO_DECIMAL(C01_STARS)<3 THEN C01_STARS END AS C01_BREAST_CANCER,
-                               CASE WHEN TRY_TO_DECIMAL(C02_STARS)<3 THEN C02_STARS END AS C02_COLORECTAL,
-                               CASE WHEN TRY_TO_DECIMAL(C03_STARS)<3 THEN C03_STARS END AS C03_FLU,
-                               CASE WHEN TRY_TO_DECIMAL(C12_STARS)<3 THEN C12_STARS END AS C12_BLOOD_SUGAR,
-                               CASE WHEN TRY_TO_DECIMAL(C14_STARS)<3 THEN C14_STARS END AS C14_BLOOD_PRESSURE,
-                               CASE WHEN TRY_TO_DECIMAL(C18_STARS)<3 THEN C18_STARS END AS C18_READMISSIONS,
-                               CASE WHEN TRY_TO_DECIMAL(D08_STARS)<3 THEN D08_STARS END AS D08_MED_ADHERENCE_DIAB,
-                               CASE WHEN TRY_TO_DECIMAL(D09_STARS)<3 THEN D09_STARS END AS D09_MED_ADHERENCE_HTN,
-                               CASE WHEN TRY_TO_DECIMAL(D10_STARS)<3 THEN D10_STARS END AS D10_MED_ADHERENCE_CHOL
+                               CASE WHEN TRY_TO_DECIMAL(C01_STARS)<3 THEN C01_STARS END AS "C01: Breast Cancer Screening",
+                               CASE WHEN TRY_TO_DECIMAL(C02_STARS)<3 THEN C02_STARS END AS "C02: Colorectal Cancer Screening",
+                               CASE WHEN TRY_TO_DECIMAL(C03_STARS)<3 THEN C03_STARS END AS "C03: Annual Flu Vaccine",
+                               CASE WHEN TRY_TO_DECIMAL(C12_STARS)<3 THEN C12_STARS END AS "C12: Blood Sugar Controlled",
+                               CASE WHEN TRY_TO_DECIMAL(C14_STARS)<3 THEN C14_STARS END AS "C14: Controlling Blood Pressure",
+                               CASE WHEN TRY_TO_DECIMAL(C18_STARS)<3 THEN C18_STARS END AS "C18: Plan All-Cause Readmissions",
+                               CASE WHEN TRY_TO_DECIMAL(D08_STARS)<3 THEN D08_STARS END AS "D08: Med Adherence Diabetes",
+                               CASE WHEN TRY_TO_DECIMAL(D09_STARS)<3 THEN D09_STARS END AS "D09: Med Adherence Hypertension",
+                               CASE WHEN TRY_TO_DECIMAL(D10_STARS)<3 THEN D10_STARS END AS "D10: Med Adherence Cholesterol"
                         FROM BASE WHERE 1=1 {fc} {cc}
                         ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC LIMIT 200"""
                 elif measure_view == "2027 Part C Weights":
@@ -464,42 +492,8 @@ with tab6:
                 fc = build_filter_clause()
 
                 # Build measure columns based on selection
-                c_measures = [
-                    ("C01","BREAST_CANCER_SCREENING",1),("C02","COLORECTAL_CANCER_SCREENING",1),
-                    ("C03","ANNUAL_FLU_VACCINE",1),("C04","IMPROVING_OR_MAINTAINING_PHYSICAL_HEALTH",3),
-                    ("C05","IMPROVING_OR_MAINTAINING_MENTAL_HEALTH",3),("C06","MONITORING_PHYSICAL_ACTIVITY",1),
-                    ("C07","SPECIAL_NEEDS_PLAN_SNP_CARE_MANAGEMENT",1),("C08","CARE_FOR_OLDER_ADULTS_MEDICATION_REVIEW",1),
-                    ("C09","CARE_FOR_OLDER_ADULTS_PAIN_ASSESSMENT","NULL"),
-                    ("C10","OSTEOPOROSIS_MANAGEMENT_IN_WOMEN_WHO_HAD_A_FRACTURE",1),
-                    ("C11","DIABETES_CARE_EYE_EXAM",1),("C12","DIABETES_CARE_BLOOD_SUGAR_CONTROLLED",3),
-                    ("C13","KIDNEY_HEALTH_EVALUATION_FOR_PATIENTS_WITH_DIABETES",1),
-                    ("C14","CONTROLLING_HIGH_BLOOD_PRESSURE",3),("C15","REDUCING_THE_RISK_OF_FALLING",1),
-                    ("C16","IMPROVING_BLADDER_CONTROL",1),
-                    ("C17","MEDICATION_RECONCILIATION_POST_DISCHARGE","NULL"),
-                    ("C18","PLAN_ALL_CAUSE_READMISSIONS",3),
-                    ("C19","STATIN_THERAPY_FOR_PATIENTS_WITH_CARDIOVASCULAR_DISEASE",1),
-                    ("C20","TRANSITIONS_OF_CARE",1),
-                    ("C21","FOLLOW_UP_AFTER_EMERGENCY_DEPARTMENT_VISIT_FOR_PEOPLE_WITH_MULTIPLE_HIGH_RISK_CHRONIC_CONDITIONS",1),
-                    ("C22","GETTING_NEEDED_CARE",2),("C23","GETTING_APPOINTMENTS_AND_CARE_QUICKLY",2),
-                    ("C24","CUSTOMER_SERVICE",2),("C25","RATING_OF_HEALTH_CARE_QUALITY",2),
-                    ("C26","RATING_OF_HEALTH_PLAN",2),("C27","CARE_COORDINATION",2),
-                    ("C28","COMPLAINTS_ABOUT_THE_HEALTH_PLAN",2),("C29","MEMBERS_CHOOSING_TO_LEAVE_THE_PLAN",2),
-                    ("C30","HEALTH_PLAN_QUALITY_IMPROVEMENT",5),
-                    ("C31","PLAN_MAKES_TIMELY_DECISIONS_ABOUT_APPEALS",2),
-                    ("C32","REVIEWING_APPEALS_DECISIONS",2),
-                    ("C33","CALL_CENTER_FOREIGN_LANGUAGE_INTERPRETER_AND_TTY_AVAILABILITY",2),
-                ]
-                d_measures = [
-                    ("D01","CALL_CENTER_FOREIGN_LANGUAGE_INTERPRETER_AND_TTY_AVAILABILITY",2),
-                    ("D02","COMPLAINTS_ABOUT_THE_DRUG_PLAN",2),("D03","MEMBERS_CHOOSING_TO_LEAVE_THE_PLAN",2),
-                    ("D04","DRUG_PLAN_QUALITY_IMPROVEMENT",5),("D05","RATING_OF_DRUG_PLAN",2),
-                    ("D06","GETTING_NEEDED_PRESCRIPTION_DRUGS",2),("D07","MPF_PRICE_ACCURACY",1),
-                    ("D08","MEDICATION_ADHERENCE_FOR_DIABETES_MEDICATIONS",3),
-                    ("D09","MEDICATION_ADHERENCE_FOR_HYPERTENSION_RAS_ANTAGONISTS",3),
-                    ("D10","MEDICATION_ADHERENCE_FOR_CHOLESTEROL_STATINS",3),
-                    ("D11","MTM_PROGRAM_COMPLETION_RATE_FOR_CMR","NULL"),
-                    ("D12","STATIN_USE_IN_PERSONS_WITH_DIABETES_SUPD",1),
-                ]
+                c_measures = [("C01","Breast Cancer Screening",1),("C02","Colorectal Cancer Screening",1),("C03","Annual Flu Vaccine",1),("C04","Improving or Maintaining Physical Health",3),("C05","Improving or Maintaining Mental Health",3),("C06","Monitoring Physical Activity",1),("C07","Special Needs Plan (SNP) Care Management",1),("C08","Care for Older Adults - Medication Review",1),("C09","Care for Older Adults - Pain Assessment",NULL),("C10","Osteoporosis Management in Women Who Had a Fracture",1),("C11","Diabetes Care - Eye Exam",1),("C12","Diabetes Care - Blood Sugar Controlled",3),("C13","Kidney Health Evaluation for Patients with Diabetes",1),("C14","Controlling High Blood Pressure",3),("C15","Reducing the Risk of Falling",1),("C16","Improving Bladder Control",1),("C17","Medication Reconciliation Post-Discharge",NULL),("C18","Plan All-Cause Readmissions",3),("C19","Statin Therapy for Patients with Cardiovascular Disease",1),("C20","Transitions of Care",1),("C21","Follow-up After ED Visit for Multiple High-Risk Chronic Conditions",1),("C22","Getting Needed Care",2),("C23","Getting Appointments and Care Quickly",2),("C24","Customer Service",2),("C25","Rating of Health Care Quality",2),("C26","Rating of Health Plan",2),("C27","Care Coordination",2),("C28","Complaints About the Health Plan",2),("C29","Members Choosing to Leave the Plan",2),("C30","Health Plan Quality Improvement",5),("C31","Plan Makes Timely Decisions About Appeals",2),("C32","Reviewing Appeals Decisions",2),("C33","Call Center Foreign Language Interpreter and TTY Availability",2)]
+                d_measures = [("D01","Call Center Foreign Language Interpreter and TTY Availability (Part D)",2),("D02","Complaints About the Drug Plan",2),("D03","Members Choosing to Leave the Plan (Part D)",2),("D04","Drug Plan Quality Improvement",5),("D05","Rating of Drug Plan",2),("D06","Getting Needed Prescription Drugs",2),("D07","MPF Price Accuracy",1),("D08","Medication Adherence for Diabetes Medications",3),("D09","Medication Adherence for Hypertension (RAS Antagonists)",3),("D10","Medication Adherence for Cholesterol (Statins)",3),("D11","MTM Program Completion Rate for CMR",NULL),("D12","Statin Use in Persons with Diabetes (SUPD)",1)]
 
                 measures = []
                 if perf_type in ["Part C", "Both"]: measures += c_measures
@@ -507,11 +501,10 @@ with tab6:
 
                 meas_cols = []
                 for code, name, weight in measures:
-                    label = f"{code}: {name.replace('_',' ').title()}"
                     if perf_view in ["Data + Stars + Weight", "Data only"]:
-                        meas_cols.append(f'{code}_DATA AS "{code}_DATA (W:{weight})"')
+                        meas_cols.append(f'{code}_DATA AS "{code}: {name} [Data] (W:{weight})"')
                     if perf_view in ["Data + Stars + Weight", "Stars only"]:
-                        meas_cols.append(f'{code}_STARS AS "{code}_STARS"')
+                        meas_cols.append(f'{code}_STARS AS "{code}: {name} [Stars]"')
 
                 meas_sql = ", ".join(meas_cols)
 
