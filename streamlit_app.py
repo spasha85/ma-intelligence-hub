@@ -40,6 +40,29 @@ def run_query(sql):
     rows = cur.fetchall()
     return pd.DataFrame(rows, columns=cols)
 
+@st.cache_data(ttl=86400)
+def load_measure_weights():
+    """Load 2027 measure weights from Snowflake tables."""
+    try:
+        c_df = run_query(f"""
+            SELECT MEASURE_NAME,
+                   TRY_TO_NUMBER(PART_C_SUMMARY_AND_MA_PD_OVERALL_WEIGHT) AS WEIGHT
+            FROM MA_ANALYTICS.DATA_PROCESSING.STAR_RATINGS_2027_PART_C_MEASURES
+        """)
+        d_df = run_query(f"""
+            SELECT MEASURE_NAME,
+                   TRY_TO_NUMBER(PART_D_SUMMARY_AND_MA_PD_OVERALL_WEIGHT) AS WEIGHT
+            FROM MA_ANALYTICS.DATA_PROCESSING.STAR_RATINGS_2027_PART_D_MEASURES
+        """)
+        weights = {}
+        for _, row in c_df.iterrows():
+            weights[str(row["MEASURE_NAME"])] = row["WEIGHT"]
+        for _, row in d_df.iterrows():
+            weights[str(row["MEASURE_NAME"])] = row["WEIGHT"]
+        return weights
+    except Exception:
+        return {}
+
 DB = "MA_ANALYTICS.DATA_PROCESSING"
 
 # ── BASE CTE ──────────────────────────────────────────────────────────────────
@@ -449,9 +472,19 @@ with tab5:
                         FROM BASE WHERE 1=1 {fc} {cc}
                         ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC LIMIT 200"""
                 elif measure_view == "2027 Part C Weights":
-                    q = f"SELECT * FROM {DB}.STAR_RATINGS_2027_PART_C_MEASURES ORDER BY PART_C_SUMMARY_AND_MA_PD_OVERALL_WEIGHT DESC"
+                    q = f"""SELECT
+                               MEASURE_NAME,
+                               WEIGHTING_CATEGORY,
+                               PART_C_SUMMARY_AND_MA_PD_OVERALL_WEIGHT AS WEIGHT
+                            FROM {DB}.STAR_RATINGS_2027_PART_C_MEASURES
+                            ORDER BY TRY_TO_NUMBER(PART_C_SUMMARY_AND_MA_PD_OVERALL_WEIGHT) DESC"""
                 elif measure_view == "2027 Part D Weights":
-                    q = f"SELECT * FROM {DB}.STAR_RATINGS_2027_PART_D_MEASURES ORDER BY PART_D_SUMMARY_AND_MA_PD_OVERALL_WEIGHT DESC"
+                    q = f"""SELECT
+                               MEASURE_NAME,
+                               WEIGHTING_CATEGORY,
+                               PART_D_SUMMARY_AND_MA_PD_OVERALL_WEIGHT AS WEIGHT
+                            FROM {DB}.STAR_RATINGS_2027_PART_D_MEASURES
+                            ORDER BY TRY_TO_NUMBER(PART_D_SUMMARY_AND_MA_PD_OVERALL_WEIGHT) DESC"""
                 elif measure_view == "Measure Crosswalk":
                     q = f"SELECT * FROM {DB}.STAR_RATINGS_MEASURE_CROSSWALK ORDER BY COLUMN_INDEX"
                 elif measure_view == "Part C Cut Points":
@@ -492,17 +525,23 @@ with tab6:
                 fc = build_filter_clause()
 
                 # Build measure columns based on selection
-                c_measures = [("C01","Breast Cancer Screening",1),("C02","Colorectal Cancer Screening",1),("C03","Annual Flu Vaccine",1),("C04","Improving or Maintaining Physical Health",3),("C05","Improving or Maintaining Mental Health",3),("C06","Monitoring Physical Activity",1),("C07","Special Needs Plan (SNP) Care Management",1),("C08","Care for Older Adults - Medication Review",1),("C09","Care for Older Adults - Pain Assessment",NULL),("C10","Osteoporosis Management in Women Who Had a Fracture",1),("C11","Diabetes Care - Eye Exam",1),("C12","Diabetes Care - Blood Sugar Controlled",3),("C13","Kidney Health Evaluation for Patients with Diabetes",1),("C14","Controlling High Blood Pressure",3),("C15","Reducing the Risk of Falling",1),("C16","Improving Bladder Control",1),("C17","Medication Reconciliation Post-Discharge",NULL),("C18","Plan All-Cause Readmissions",3),("C19","Statin Therapy for Patients with Cardiovascular Disease",1),("C20","Transitions of Care",1),("C21","Follow-up After ED Visit for Multiple High-Risk Chronic Conditions",1),("C22","Getting Needed Care",2),("C23","Getting Appointments and Care Quickly",2),("C24","Customer Service",2),("C25","Rating of Health Care Quality",2),("C26","Rating of Health Plan",2),("C27","Care Coordination",2),("C28","Complaints About the Health Plan",2),("C29","Members Choosing to Leave the Plan",2),("C30","Health Plan Quality Improvement",5),("C31","Plan Makes Timely Decisions About Appeals",2),("C32","Reviewing Appeals Decisions",2),("C33","Call Center Foreign Language Interpreter and TTY Availability",2)]
-                d_measures = [("D01","Call Center Foreign Language Interpreter and TTY Availability (Part D)",2),("D02","Complaints About the Drug Plan",2),("D03","Members Choosing to Leave the Plan (Part D)",2),("D04","Drug Plan Quality Improvement",5),("D05","Rating of Drug Plan",2),("D06","Getting Needed Prescription Drugs",2),("D07","MPF Price Accuracy",1),("D08","Medication Adherence for Diabetes Medications",3),("D09","Medication Adherence for Hypertension (RAS Antagonists)",3),("D10","Medication Adherence for Cholesterol (Statins)",3),("D11","MTM Program Completion Rate for CMR",NULL),("D12","Statin Use in Persons with Diabetes (SUPD)",1)]
+                c_measures = [("C01","Breast Cancer Screening",1),("C02","Colorectal Cancer Screening",1),("C03","Annual Flu Vaccine",1),("C04","Improving or Maintaining Physical Health",3),("C05","Improving or Maintaining Mental Health",3),("C06","Monitoring Physical Activity",1),("C07","Special Needs Plan (SNP) Care Management",1),("C08","Care for Older Adults - Medication Review",1),("C09","Care for Older Adults - Pain Assessment","NULL"),("C10","Osteoporosis Management in Women Who Had a Fracture",1),("C11","Diabetes Care - Eye Exam",1),("C12","Diabetes Care - Blood Sugar Controlled",3),("C13","Kidney Health Evaluation for Patients with Diabetes",1),("C14","Controlling High Blood Pressure",3),("C15","Reducing the Risk of Falling",1),("C16","Improving Bladder Control",1),("C17","Medication Reconciliation Post-Discharge","NULL"),("C18","Plan All-Cause Readmissions",3),("C19","Statin Therapy for Patients with Cardiovascular Disease",1),("C20","Transitions of Care",1),("C21","Follow-up After ED Visit for Multiple High-Risk Chronic Conditions",1),("C22","Getting Needed Care",2),("C23","Getting Appointments and Care Quickly",2),("C24","Customer Service",2),("C25","Rating of Health Care Quality",2),("C26","Rating of Health Plan",2),("C27","Care Coordination",2),("C28","Complaints About the Health Plan",2),("C29","Members Choosing to Leave the Plan",2),("C30","Health Plan Quality Improvement",5),("C31","Plan Makes Timely Decisions About Appeals",2),("C32","Reviewing Appeals Decisions",2),("C33","Call Center Foreign Language Interpreter and TTY Availability",2)]
+                d_measures = [("D01","Call Center Foreign Language Interpreter and TTY Availability (Part D)",2),("D02","Complaints About the Drug Plan",2),("D03","Members Choosing to Leave the Plan (Part D)",2),("D04","Drug Plan Quality Improvement",5),("D05","Rating of Drug Plan",2),("D06","Getting Needed Prescription Drugs",2),("D07","MPF Price Accuracy",1),("D08","Medication Adherence for Diabetes Medications",3),("D09","Medication Adherence for Hypertension (RAS Antagonists)",3),("D10","Medication Adherence for Cholesterol (Statins)",3),("D11","MTM Program Completion Rate for CMR","NULL"),("D12","Statin Use in Persons with Diabetes (SUPD)",1)]
 
                 measures = []
                 if perf_type in ["Part C", "Both"]: measures += c_measures
                 if perf_type in ["Part D", "Both"]: measures += d_measures
 
+                # Load live weights from Snowflake 2027 measure tables
+                sf_weights = load_measure_weights()
+
                 meas_cols = []
                 for code, name, weight in measures:
+                    # Use live weight from Snowflake if available, else fall back to hardcoded
+                    live_w = sf_weights.get(name)
+                    w_label = live_w if live_w is not None else ("N/A" if str(weight) == "NULL" else weight)
                     if perf_view in ["Data + Stars + Weight", "Data only"]:
-                        meas_cols.append(f'{code}_DATA AS "{code}: {name} [Data] (W:{weight})"')
+                        meas_cols.append(f'{code}_DATA AS "{code}: {name} [Data] (W:{w_label})"')
                     if perf_view in ["Data + Stars + Weight", "Stars only"]:
                         meas_cols.append(f'{code}_STARS AS "{code}: {name} [Stars]"')
 
