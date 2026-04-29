@@ -92,8 +92,8 @@ with st.sidebar:
     with enr_col1:
         f_enr_min = st.number_input("Min Enrollment", min_value=0, value=0, step=1000)
     with enr_col2:
-        f_enr_max = st.number_input("Max Enrollment", min_value=0, value=0, step=10000,
-                                     help="0 = no limit")
+        f_enr_max = st.number_input("Max Enrollment", min_value=0, value=50000, step=10000,
+                                     help="Default 50,000 — focuses on small/regional plans without in-house analytics teams")
 
     f_stars_max = st.selectbox("Max Overall Stars", ["Any","< 2.0","< 2.5","< 3.0","< 3.5","< 4.0"])
     f_cap_only  = st.checkbox("CAP issues only")
@@ -173,11 +173,15 @@ with tab1:
                            CASE WHEN CAP_ISSUE_TYPE  IS NOT NULL THEN '✓' ELSE '' END AS HAS_CAP,
                            CAP_ISSUE_TYPE,
                            CASE WHEN OVERALL_FAC     IS NOT NULL THEN '✓' ELSE '' END AS CAI_FLAG,
-                           (CASE WHEN CAP_ISSUE_TYPE IS NOT NULL THEN 30 ELSE 0 END
-                          + CASE WHEN REASON_FOR_LPI IS NOT NULL THEN 25 ELSE 0 END
-                          + CASE WHEN TRY_TO_DECIMAL(OVERALL_STARS) < 3.0 THEN 20
-                                 WHEN TRY_TO_DECIMAL(OVERALL_STARS) < 3.5 THEN 10 ELSE 0 END
-                          + CASE WHEN OVERALL_FAC    IS NOT NULL THEN 15 ELSE 0 END)::NUMBER AS OPPORTUNITY_SCORE
+                           OPPORTUNITY_SCORE,
+                           CASE
+                               WHEN UPPER(PARENT_ORGANIZATION) SIMILAR TO
+                                   '%(HUMANA|UNITED|AETNA|CVS|CENTENE|MOLINA|ANTHEM|BCBS|BLUE CROSS|BLUE SHIELD|KAISER|CIGNA|WELLCARE|ELEVANCE|CARESOURCE|OSCAR|BRIGHT HEALTH)%'
+                               THEN '❌ Large National - Skip'
+                               WHEN MBR_CNT > 150000 THEN '⚠️ Large - Likely Has Team'
+                               WHEN MBR_CNT > 50000  THEN '🟡 Mid-Size - Maybe'
+                               ELSE '✅ Small/Regional - Target'
+                           END AS ANALYTICS_TEAM_ASSESSMENT
                     FROM BASE
                     WHERE (CASE WHEN CAP_ISSUE_TYPE IS NOT NULL THEN 30 ELSE 0 END
                          + CASE WHEN REASON_FOR_LPI IS NOT NULL THEN 25 ELSE 0 END
@@ -532,71 +536,68 @@ with tab8:
     MBR_CNT (enrollment), STATE, PLAN_TYPE, CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
     OVERALL_STARS, PART_C_STARS, PART_D_STARS, REASON_FOR_LPI (NULL=not low performer),
     OVERALL_FAC (NULL=no CAI flag), CAP_ISSUE_TYPE (NULL=no CAP), CAP_ISSUE_SUMMARY,
-    CAP_CONTACT_NAME, CAP_CONTACT_PHONE,
-    C01-C33 _DATA/_STARS/_WEIGHT (Part C measures), D01-D12 _DATA/_STARS/_WEIGHT (Part D measures).
+    CAP_CONTACT_NAME, CAP_CONTACT_PHONE, OPPORTUNITY_SCORE (pre-computed).
     Key measures: C12=Blood Sugar(3), C14=Blood Pressure(3), C18=Readmissions(3), C30=Quality Improvement(5),
     D08=Med Adherence Diabetes(3), D09=Hypertension(3), D10=Cholesterol(3), D04=Drug Quality(5).
-    OPPORTUNITY_SCORE = (CAP_ISSUE_TYPE IS NOT NULL)*30 + (REASON_FOR_LPI IS NOT NULL)*25 +
-    (OVERALL_STARS<3.0)*20 or (OVERALL_STARS<3.5)*10 + (OVERALL_FAC IS NOT NULL)*15.
 
-    IN-HOUSE ANALYTICS TEAM PROXY — infer likelihood from:
-    - MBR_CNT > 100000: Large plan, likely has strong in-house team (lower consulting need)
-    - MBR_CNT 25000-100000: Mid-size, may have small analytics team (moderate need)
-    - MBR_CNT < 25000: Small/regional plan, unlikely to have dedicated analytics team (HIGH consulting need)
-    - PARENT_ORGANIZATION with 'Humana','United','Aetna','CVS','Centene','Molina','Anthem','BCBS','Kaiser':
-      Large national parent — in-house team likely exists at parent level
-    - Independent/regional plans with no large parent: likely NO in-house analytics team
-    Always flag this in your analysis.
+    CRITICAL - CONSULTING FIT LOGIC (always apply when generating SQL):
+    EXCLUDE from results any plan where PARENT_ORGANIZATION ILIKE any of:
+    '%Humana%','%United%','%UnitedHealth%','%Aetna%','%CVS%','%Centene%','%Molina%',
+    '%Anthem%','%BCBS%','%Blue Cross%','%Blue Shield%','%Kaiser%','%Cigna%',
+    '%WellCare%','%Elevance%','%CareSource%','%Oscar%','%Bright Health%'
+    These companies have large in-house analytics teams and are NOT consulting targets.
+
+    IDEAL TARGET PROFILE:
+    - Independent or regional parent organization
+    - MBR_CNT < 50000 (small enough to need outside help)
+    - OVERALL_STARS < 3.5 OR CAP_ISSUE_TYPE IS NOT NULL OR REASON_FOR_LPI IS NOT NULL
+    Always add these filters to SQL unless user explicitly asks for large plans.
     """
 
     BASE_CTE_FOR_CHAT = "WITH BASE AS (SELECT * FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB)"
 
-    SQL_GEN_PROMPT = f"""You are a Snowflake SQL expert. Given a question about Medicare Advantage plans,
-generate a SQL query using the BASE CTE below. Return ONLY valid Snowflake SQL — no explanation, no markdown, no backticks.
+    SQL_GEN_PROMPT = f"""You are a Snowflake SQL expert generating queries for Sadaf's MA consulting firm.
+She targets ONLY small independent plans without in-house analytics teams.
 
 {SCHEMA_CONTEXT}
 
-Rules:
-- Always use WITH BASE AS (...) [BASE_CTE] SELECT DISTINCT ... FROM BASE
-- Include CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME, STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT, CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL
-- Always include OVERALL_STARS, PART_C_STARS, PART_D_STARS
-- For opportunity questions: include OPPORTUNITY_SCORE, sort DESC by it, LIMIT 20
-- For CAP questions: filter WHERE CAP_ISSUE_TYPE IS NOT NULL
-- For low performer questions: filter WHERE REASON_FOR_LPI IS NOT NULL
-- For state questions: filter WHERE STATE = 'XX'
-- Always LIMIT results to 50 max
-- The BASE_CTE placeholder must be replaced with the actual CTE
+ALWAYS use this CTE: {BASE_CTE_FOR_CHAT}
 
-Replace [BASE_CTE] in your query with this exact text:
-{BASE_CTE_FOR_CHAT}
+ALWAYS include these columns:
+CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME, PARENT_ORGANIZATION,
+STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+OVERALL_STARS, PART_C_STARS, PART_D_STARS, OPPORTUNITY_SCORE,
+CASE WHEN UPPER(PARENT_ORGANIZATION) SIMILAR TO '%(HUMANA|UNITED|AETNA|CVS|CENTENE|MOLINA|ANTHEM|BCBS|BLUE CROSS|BLUE SHIELD|KAISER|CIGNA|WELLCARE|ELEVANCE)%'
+     THEN 'Large National - Skip'
+     WHEN MBR_CNT > 150000 THEN 'Large - Likely Has Team'
+     WHEN MBR_CNT > 50000  THEN 'Mid-Size - Maybe'
+     ELSE 'Small/Regional - TARGET'
+END AS CONSULTING_FIT
+
+UNLESS user explicitly asks for large plans, ALWAYS add:
+AND NOT (UPPER(PARENT_ORGANIZATION) SIMILAR TO '%(HUMANA|UNITED|AETNA|CVS|CENTENE|MOLINA|ANTHEM|BCBS|BLUE CROSS|BLUE SHIELD|KAISER|CIGNA|WELLCARE|ELEVANCE)%')
+AND MBR_CNT < 150000
+
+For opportunities: ORDER BY OPPORTUNITY_SCORE DESC LIMIT 20
+For CAP: AND CAP_ISSUE_TYPE IS NOT NULL
+For low performers: AND REASON_FOR_LPI IS NOT NULL
+Always LIMIT 50 max. Return ONLY SQL — no explanation, no markdown, no backticks.
 
 Question: """
-
-    EXPLAIN_PROMPT = """You are an expert MA consulting analyst for Sadaf who is building an
-independent consulting firm. Given query results, provide a smart 3-5 bullet analysis:
-
-1. WHO TO CALL FIRST: Name the top 1-2 plans with contract ID, contact name/phone/email
-2. WHY THEY NEED HELP: Specific weaknesses (low stars, CAP issues, LPI flag, weak measures)
-3. IN-HOUSE ANALYTICS: Based on enrollment size and parent org, assess if they likely have
-   an in-house analytics team:
-   - Under 25K members OR independent/regional parent = likely NO in-house team → HIGH priority
-   - 25K-100K members = may have small team → MEDIUM priority
-   - Over 100K OR large national parent (Humana/United/Aetna/CVS/Centene/Anthem/BCBS/Kaiser) = likely HAS team → LOWER priority
-4. CONSULTING PITCH: One sentence tailored pitch for each top plan
-Be specific — use actual plan names, contract IDs, star ratings, and contact info from the data."""
 
     # Quick questions
     st.write("**Quick questions:**")
     quick_qs = [
-        "Who should I reach out to first for consulting?",
-        "Which plans have CAP issues — show contact details",
-        "Which plans are on the low performer list?",
-        "Show me plans below 3 stars with contact info",
-        "Which plans have the worst medication adherence?",
-        "Show plans in California with low stars",
-        "Which plans have both CAP issues and low stars?",
-        "Show plans with CAI flags and their enrollment",
-        "Which parent organizations have the most issues?",
+        "Top 10 small independent plans to target for consulting",
+        "Small plans with CAP issues — show contact details",
+        "Low performer plans that are small and independent",
+        "Plans below 3 stars with under 50,000 members",
+        "Small plans with worst medication adherence scores",
+        "Independent plans in California with low stars",
+        "Small plans with both CAP issues and low stars",
+        "Regional plans with CAI flags — no large parent org",
+        "Which small plans have the highest opportunity score?",
     ]
     cols = st.columns(3)
     for i, q in enumerate(quick_qs):
