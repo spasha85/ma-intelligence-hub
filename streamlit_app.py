@@ -627,6 +627,153 @@ Question: """
             st.markdown(user_prompt)
         st.session_state.chat_run = True
 
+    # Pre-built SQL for quick questions (fast, no AI SQL generation)
+    QUICK_SQL = {
+        "Top 10 small independent plans to target for consulting": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, PART_C_STARS, PART_D_STARS,
+                   OPPORTUNITY_SCORE,
+                   CASE WHEN MBR_CNT < 50000 THEN 'Small - TARGET'
+                        WHEN MBR_CNT < 150000 THEN 'Mid-Size - Maybe'
+                        ELSE 'Large - Skip' END AS CONSULTING_FIT
+            FROM BASE
+            WHERE MBR_CNT < 150000
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE SHIELD%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
+            ORDER BY OPPORTUNITY_SCORE DESC LIMIT 20""",
+
+        "Small plans with CAP issues — show contact details": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, CAP_ISSUE_TYPE, CAP_ISSUE_SUMMARY,
+                   CAP_CONTACT_NAME, CAP_CONTACT_PHONE
+            FROM BASE
+            WHERE CAP_ISSUE_TYPE IS NOT NULL
+            AND MBR_CNT < 150000
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            ORDER BY OVERALL_STARS ASC LIMIT 30""",
+
+        "Low performer plans that are small and independent": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, REASON_FOR_LPI, CAP_ISSUE_TYPE
+            FROM BASE
+            WHERE REASON_FOR_LPI IS NOT NULL
+            ORDER BY MBR_CNT ASC LIMIT 20""",
+
+        "Plans below 3 stars with under 50,000 members": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, PART_C_STARS, PART_D_STARS, OPPORTUNITY_SCORE
+            FROM BASE
+            WHERE TRY_TO_DECIMAL(OVERALL_STARS) < 3.0
+            AND MBR_CNT < 50000
+            ORDER BY OVERALL_STARS ASC LIMIT 30""",
+
+        "Small plans with worst medication adherence scores": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS,
+                   D08_STARS AS MED_ADHERENCE_DIABETES,
+                   D09_STARS AS MED_ADHERENCE_HYPERTENSION,
+                   D10_STARS AS MED_ADHERENCE_CHOLESTEROL
+            FROM BASE
+            WHERE MBR_CNT < 150000
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            ORDER BY TRY_TO_DECIMAL(D08_STARS) ASC NULLS LAST LIMIT 30""",
+
+        "Independent plans in California with low stars": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, PART_C_STARS, PART_D_STARS, OPPORTUNITY_SCORE
+            FROM BASE
+            WHERE STATE = 'CA'
+            AND TRY_TO_DECIMAL(OVERALL_STARS) < 3.5
+            AND MBR_CNT < 150000
+            ORDER BY OVERALL_STARS ASC LIMIT 30""",
+
+        "Small plans with both CAP issues and low stars": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, CAP_ISSUE_TYPE, CAP_ISSUE_SUMMARY, OPPORTUNITY_SCORE
+            FROM BASE
+            WHERE CAP_ISSUE_TYPE IS NOT NULL
+            AND TRY_TO_DECIMAL(OVERALL_STARS) < 3.5
+            AND MBR_CNT < 150000
+            ORDER BY OPPORTUNITY_SCORE DESC LIMIT 30""",
+
+        "Regional plans with CAI flags — no large parent org": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, OVERALL_FAC, PART_C_FAC, OPPORTUNITY_SCORE
+            FROM BASE
+            WHERE OVERALL_FAC IS NOT NULL
+            AND MBR_CNT < 150000
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            ORDER BY OPPORTUNITY_SCORE DESC LIMIT 30""",
+
+        "Which small plans have the highest opportunity score?": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, OPPORTUNITY_SCORE,
+                   CASE WHEN CAP_ISSUE_TYPE IS NOT NULL THEN 'YES' ELSE 'NO' END AS HAS_CAP,
+                   CASE WHEN REASON_FOR_LPI IS NOT NULL THEN 'YES' ELSE 'NO' END AS LOW_PERFORMER,
+                   CASE WHEN OVERALL_FAC IS NOT NULL THEN 'YES' ELSE 'NO' END AS HAS_CAI
+            FROM BASE
+            WHERE MBR_CNT < 150000
+            ORDER BY OPPORTUNITY_SCORE DESC, MBR_CNT ASC LIMIT 20""",
+    }
+
     # Process
     if st.session_state.get("chat_run") and st.session_state.chat_messages:
         st.session_state.chat_run = False
@@ -634,29 +781,15 @@ Question: """
         if not isinstance(last_q, pd.DataFrame):
 
             with st.chat_message("assistant"):
-                with st.spinner("Generating SQL and querying your data..."):
+                with st.spinner("Querying your Snowflake data..."):
                     try:
                         conn = get_connection()
                         cur = conn.cursor()
 
-                        # Step 1: Generate SQL using faster mistral-large (not large2)
-                        sql_request = SQL_GEN_PROMPT + last_q
-                        sql_request_esc = sql_request.replace("\\", "\\\\").replace("'", "\\'")
-                        cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{sql_request_esc}') AS SQL_QUERY")
-                        raw_sql_response = cur.fetchone()[0]
-
-                        # Parse SQL
-                        try:
-                            parsed = json.loads(raw_sql_response)
-                            generated_sql = parsed["choices"][0]["message"]["content"].strip()
-                        except Exception:
-                            generated_sql = raw_sql_response.strip()
-
-                        generated_sql = generated_sql.replace("```sql", "").replace("```", "").strip()
-
-                        # Step 2: Run SQL
-                        try:
-                            cur.execute(generated_sql)
+                        # Check if it is a quick question with pre-built SQL
+                        if last_q in QUICK_SQL:
+                            sql = QUICK_SQL[last_q].format(BASE_CTE_FOR_CHAT=BASE_CTE_FOR_CHAT)
+                            cur.execute(sql)
                             cols = [c[0] for c in cur.description]
                             rows = cur.fetchall()
                             result_df = pd.DataFrame(rows, columns=cols)
@@ -665,46 +798,81 @@ Question: """
                             st.dataframe(result_df, use_container_width=True, height=350)
                             st.session_state.chat_messages.append({"role": "assistant", "content": result_df})
 
-                            # Step 3: Explain — only top 5 rows, short prompt, no JSON parsing
                             if len(result_df) > 0:
                                 data_preview = result_df.head(5).to_string(index=False)
-                                explain_req = (
-                                    f"{EXPLAIN_PROMPT}\n\n"
-                                    f"Question: {last_q}\n\nTop results (showing up to 5):\n{data_preview}"
-                                )
+                                explain_req = f"{EXPLAIN_PROMPT}\n\nQuestion: {last_q}\n\nTop results:\n{data_preview}"
                                 explain_esc = explain_req.replace("\\", "\\\\").replace("'", "\\'")
-                                cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{explain_esc}') AS EXPLANATION")
-                                raw_exp = cur.fetchone()[0]
+                                cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{explain_esc}') AS ANSWER")
+                                raw = cur.fetchone()[0]
                                 try:
-                                    parsed_exp = json.loads(raw_exp)
-                                    explanation = parsed_exp["choices"][0]["message"]["content"]
+                                    parsed = json.loads(raw)
+                                    answer = parsed["choices"][0]["message"]["content"]
                                 except Exception:
-                                    explanation = raw_exp
+                                    answer = raw
                                 st.markdown("**💡 Key Takeaways:**")
-                                st.markdown(explanation)
-                                st.session_state.chat_messages.append({"role": "assistant", "content": "**💡 Key Takeaways:**\n" + explanation})
+                                st.markdown(answer)
+                                st.session_state.chat_messages.append({"role": "assistant", "content": "**💡 Key Takeaways:**\n" + answer})
 
-                            # Download
                             csv = result_df.to_csv(index=False)
                             st.download_button("⬇️ Download results", csv, "chat_results.csv", "text/csv", key=f"dl_{len(st.session_state.chat_messages)}")
 
-                        except Exception as sql_err:
-                            st.warning(f"Could not run SQL. Answering from general knowledge...")
-                            fallback_req = f"You are an MA consulting analyst. Answer very briefly (3 bullet points max): {last_q}"
-                            fallback_esc = fallback_req.replace("\\", "\\\\").replace("'", "\\'")
-                            cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{fallback_esc}') AS ANSWER")
-                            raw_fb = cur.fetchone()[0]
+                        else:
+                            # Custom question — use AI to generate SQL
+                            sql_prompt = f"{SQL_GEN_PROMPT}{last_q}"
+                            sql_esc = sql_prompt.replace("\\", "\\\\").replace("'", "\\'")
+                            cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{sql_esc}') AS SQL_OUT")
+                            raw_sql = cur.fetchone()[0]
                             try:
-                                parsed_fb = json.loads(raw_fb)
-                                fb_answer = parsed_fb["choices"][0]["message"]["content"]
+                                parsed = json.loads(raw_sql)
+                                gen_sql = parsed["choices"][0]["message"]["content"].strip()
                             except Exception:
-                                fb_answer = raw_fb
-                            st.markdown(fb_answer)
-                            st.session_state.chat_messages.append({"role": "assistant", "content": fb_answer})
+                                gen_sql = raw_sql.strip()
+
+                            gen_sql = gen_sql.replace("```sql","").replace("```","").strip()
+
+                            try:
+                                cur.execute(gen_sql)
+                                cols = [c[0] for c in cur.description]
+                                rows = cur.fetchall()
+                                result_df = pd.DataFrame(rows, columns=cols)
+                                st.success(f"Found {len(result_df)} results")
+                                st.dataframe(result_df, use_container_width=True, height=350)
+                                st.session_state.chat_messages.append({"role": "assistant", "content": result_df})
+
+                                if len(result_df) > 0:
+                                    data_preview = result_df.head(5).to_string(index=False)
+                                    explain_req = f"{EXPLAIN_PROMPT}\n\nQuestion: {last_q}\n\nTop results:\n{data_preview}"
+                                    explain_esc = explain_req.replace("\\", "\\\\").replace("'", "\\'")
+                                    cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{explain_esc}') AS ANSWER")
+                                    raw = cur.fetchone()[0]
+                                    try:
+                                        parsed = json.loads(raw)
+                                        answer = parsed["choices"][0]["message"]["content"]
+                                    except Exception:
+                                        answer = raw
+                                    st.markdown("**💡 Key Takeaways:**")
+                                    st.markdown(answer)
+                                    st.session_state.chat_messages.append({"role": "assistant", "content": "**💡 Key Takeaways:**\n" + answer})
+
+                                csv = result_df.to_csv(index=False)
+                                st.download_button("⬇️ Download results", csv, "chat_results.csv", "text/csv", key=f"dl_{len(st.session_state.chat_messages)}")
+
+                            except Exception as sql_err:
+                                st.warning(f"Could not run SQL. Answering from general knowledge...")
+                                fallback_req = f"You are an MA consulting analyst. Answer briefly (3 bullet points): {last_q}"
+                                fallback_esc = fallback_req.replace("\\", "\\\\").replace("'", "\\'")
+                                cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{fallback_esc}') AS ANSWER")
+                                raw_fb = cur.fetchone()[0]
+                                try:
+                                    parsed_fb = json.loads(raw_fb)
+                                    fb_answer = parsed_fb["choices"][0]["message"]["content"]
+                                except Exception:
+                                    fb_answer = raw_fb
+                                st.markdown(fb_answer)
+                                st.session_state.chat_messages.append({"role": "assistant", "content": fb_answer})
 
                     except Exception as e:
                         st.error(f"Error: {e}")
-
     if st.session_state.get("chat_messages"):
         if st.button("🗑️ Clear conversation", key="clear_chat"):
             st.session_state.chat_messages = []
