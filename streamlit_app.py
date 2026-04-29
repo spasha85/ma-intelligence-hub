@@ -650,7 +650,8 @@ Question: """
     for i, q in enumerate(quick_qs):
         if cols[i % 3].button(q, use_container_width=True, key=f"cq{i}"):
             st.session_state.setdefault("chat_messages", [])
-            if not st.session_state.chat_messages or st.session_state.chat_messages[-1]["content"] != q:
+            last_msg = st.session_state.chat_messages[-1]["content"] if st.session_state.chat_messages else None
+            if not isinstance(last_msg, str) or last_msg != q:
                 st.session_state.chat_messages.append({"role": "user", "content": q})
                 st.session_state.chat_run = True
 
@@ -863,19 +864,24 @@ Contract ID, Plan Name, State, Enrollment, Stars, Contact Name, Phone, Email, wh
                             st.session_state.chat_messages.append({"role": "assistant", "content": result_df})
 
                             if len(result_df) > 0:
-                                data_preview = result_df.head(5).to_string(index=False)
-                                explain_req = f"{EXPLAIN_PROMPT}\n\nQuestion: {last_q}\n\nTop results:\n{data_preview}"
-                                explain_esc = explain_req.replace("\\", "\\\\").replace("'", "\\'")
-                                cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{explain_esc}') AS ANSWER")
-                                raw = cur.fetchone()[0]
                                 try:
-                                    parsed = json.loads(raw)
-                                    answer = parsed["choices"][0]["message"]["content"]
+                                    cur2 = get_cursor()
+                                    data_preview = result_df.head(5).to_string(index=False)
+                                    explain_req = f"{EXPLAIN_PROMPT}\n\nQuestion: {last_q}\n\nTop results:\n{data_preview}"
+                                    explain_esc = explain_req.replace("\\", "\\\\").replace("'", "\\'")
+                                    cur2.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{explain_esc}') AS ANSWER")
+                                    cur2._connection.execute_helper(timeout=15)
+                                    raw = cur2.fetchone()[0]
+                                    try:
+                                        parsed = json.loads(raw)
+                                        answer = parsed["choices"][0]["message"]["content"]
+                                    except Exception:
+                                        answer = raw
+                                    st.markdown("**💡 Key Takeaways:**")
+                                    st.markdown(answer)
+                                    st.session_state.chat_messages.append({"role": "assistant", "content": "**💡 Key Takeaways:**\n" + answer})
                                 except Exception:
-                                    answer = raw
-                                st.markdown("**💡 Key Takeaways:**")
-                                st.markdown(answer)
-                                st.session_state.chat_messages.append({"role": "assistant", "content": "**💡 Key Takeaways:**\n" + answer})
+                                    pass  # Skip AI analysis if it times out — data is already shown
 
                             csv = result_df.to_csv(index=False)
                             st.download_button("⬇️ Download results", csv, "chat_results.csv", "text/csv", key=f"dl_{len(st.session_state.chat_messages)}")
