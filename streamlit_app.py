@@ -1,1652 +1,974 @@
-"""
-CMS Star Ratings Data Tables Processor + Snowflake Uploader
-============================================================
-Source : https://www.cms.gov/medicare/health-drug-plans/part-c-d-performance-data
-Target : Latest Star Ratings Data Tables (ZIP)
-
-USAGE — mix and match flags freely:
-
-  # Download + process only
-  py -3.11 process_star_ratings.py --auto
-  py -3.11 process_star_ratings.py --zip ~/Downloads/2026-star-ratings-data-tables.zip
-  py -3.11 process_star_ratings.py --url https://www.cms.gov/files/zip/2026-star-ratings-data-tables.zip
-
-  # Download + process + upload to Snowflake
-  py -3.11 process_star_ratings.py --auto --upload
-  py -3.11 process_star_ratings.py --zip my.zip --upload
-
-  # Upload only (skip download, use previously processed output)
-  py -3.11 process_star_ratings.py --upload --no-process
-
-SNOWFLAKE CONFIG — set via environment variables OR edit the SNOWFLAKE_CONFIG dict below:
-  export SNOWFLAKE_ACCOUNT="myorg-myaccount"
-  export SNOWFLAKE_USER="my_user"
-  export SNOWFLAKE_PASSWORD="my_password"
-  export SNOWFLAKE_WAREHOUSE="MY_WH"
-  export SNOWFLAKE_DATABASE="MY_DB"
-  export SNOWFLAKE_SCHEMA="MY_SCHEMA"
-  export SNOWFLAKE_ROLE="MY_ROLE"          # optional
-
-  Tables created:
-    STAR_RATINGS_MEASURE_DATA       — measure performance values
-    STAR_RATINGS_MEASURE_STARS      — measure star scores
-    STAR_RATINGS_MEASURE_CROSSWALK  — measure name + reporting period lookup
-
-OUTPUT (./star_ratings_output/):
-  star_ratings_measure_data.xlsx
-  star_ratings_measure_stars.xlsx
-  star_ratings_measure_crosswalk_combined.xlsx
-
-REQUIREMENTS:
-  pip install pandas openpyxl requests selenium snowflake-connector-python
-  Chrome + chromedriver (--auto mode only, auto-managed via webdriver-manager)
-    pip install webdriver-manager    # handles Windows, macOS, and Linux automatically
-    Or manually: https://chromedriver.chromium.org/downloads
-"""
-
-import os, sys, re, time, zipfile, argparse, tempfile, shutil, warnings
-from pathlib import Path
-
-import requests
+import streamlit as st
 import pandas as pd
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-
-warnings.filterwarnings("ignore")   # suppress Snowflake urllib3 noise
-
-# ── SNOWFLAKE CONFIG ──────────────────────────────────────────────────────────
-# Credentials are loaded automatically from config.json in the same folder.
-# Run setup once:  py -3.11 process_star_ratings.py --setup
-# You never need to edit this section manually.
-
-def _load_config() -> dict:
-    """Load Snowflake credentials from config.json, then env vars, then defaults."""
-    import json
-    cfg = {
-        "account": "", "user": "", "password": "",
-        "warehouse": "", "database": "", "schema": "", "role": ""
-    }
-    # 1. Load from config.json — check current dir first, then script dir
-    for config_path in [Path.cwd() / "config.json", Path(__file__).parent / "config.json"]:
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    file_cfg = json.load(f)
-                # Skip if values are still placeholders
-                real = {k: v for k, v in file_cfg.items() 
-                        if v and not str(v).startswith("your-") and v != ""}
-                cfg.update(real)
-                if real:
-                    print(f"  Config loaded from: {config_path}")
-                else:
-                    print(f"  Warning: config.json found but still has placeholder values.")
-                    print(f"  Please edit: {config_path}")
-                break
-            except Exception as e:
-                print(f"  Warning: could not read config.json: {e}")
-    # 2. Environment variables override config.json
-    env_map = {
-        "account": "SNOWFLAKE_ACCOUNT", "user": "SNOWFLAKE_USER",
-        "password": "SNOWFLAKE_PASSWORD", "warehouse": "SNOWFLAKE_WAREHOUSE",
-        "database": "SNOWFLAKE_DATABASE", "schema": "SNOWFLAKE_SCHEMA",
-        "role": "SNOWFLAKE_ROLE",
-    }
-    for key, env in env_map.items():
-        val = os.getenv(env, "")
-        if val:
-            cfg[key] = val
-    return cfg
-
-SNOWFLAKE_CONFIG = _load_config()
-
-# Snowflake target table names
-SF_TABLE_DATA      = "STAR_RATINGS_MEASURE_DATA"
-SF_TABLE_STARS     = "STAR_RATINGS_MEASURE_STARS"
-SF_TABLE_CROSSWALK = "STAR_RATINGS_MEASURE_CROSSWALK"
-
-# ── CMS / FILE CONFIG ─────────────────────────────────────────────────────────
-CMS_PAGE_URL       = "https://www.cms.gov/medicare/health-drug-plans/part-c-d-performance-data"
-ZIP_LINK_KEYWORDS  = ["star ratings data tables", "star-ratings-data-tables"]
-MEASURE_DATA_KEYWORDS  = ["measure data"]
-MEASURE_STARS_KEYWORDS = ["measure stars", "measure star"]
-
-# Additional tables available in the ZIP (loaded automatically)
-SUMMARY_KEYWORDS       = ["summary ratings"]
-DOMAIN_KEYWORDS        = ["domain stars"]
-CUTPOINT_C_KEYWORDS    = ["part c cut points"]
-CUTPOINT_D_KEYWORDS    = ["part d cut points"]
-OUTPUT_DIR = Path(r"C:\Users\sadaf\OneDrive\Documents\Clean File for Opportunities\Local Copies")
-
-# ── STYLES ────────────────────────────────────────────────────────────────────
-_B = Side(style="thin", color="C8D6E8")
-BORDER   = Border(left=_B, right=_B, top=_B, bottom=_B)
-HDR_FILL = PatternFill("solid", fgColor="1F4E79")
-ALT_FILL = PatternFill("solid", fgColor="EEF3F9")
-WHT_FILL = PatternFill("solid", fgColor="FFFFFF")
-HDR_FONT = Font(name="Arial", bold=True,  color="FFFFFF", size=10)
-BOD_FONT = Font(name="Arial", bold=False, color="000000", size=9)
-TTL_FONT = Font(name="Arial", bold=True,  color="1F4E79", size=11)
-
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.cms.gov/",
-}
-
-SEP = "=" * 62
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  DOWNLOAD LAYER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _find_zip_url_from_html(html: str, base_url: str) -> str:
-    from urllib.parse import urljoin
-    pattern = re.compile(r'href=["\']([^"\']+\.zip)["\']', re.IGNORECASE)
-    for m in pattern.finditer(html):
-        href  = m.group(1)
-        lower = href.lower().replace("_", "-").replace(" ", "-")
-        if any(kw.replace(" ", "-") in lower for kw in ZIP_LINK_KEYWORDS):
-            return urljoin(base_url, href)
-    for m in pattern.finditer(html):
-        href = m.group(1).lower()
-        if "star" in href and "rating" in href:
-            from urllib.parse import urljoin as _uj
-            return _uj(base_url, m.group(1))
-    return None
-
-
-def _stream_download(session: requests.Session, url: str, dest_dir: Path) -> Path:
-    print(f"  Downloading: {url}")
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    filename = url.split("/")[-1].split("?")[0] or "star_ratings.zip"
-    out_path = dest_dir / filename
-
-    with session.get(url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        total      = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    print(f"\r  Progress: {downloaded/total*100:.1f}%  ({downloaded/1024:.0f} KB)",
-                          end="", flush=True)
-    print()
-
-    if out_path.stat().st_size < 1000:
-        raise RuntimeError(f"Downloaded file too small ({out_path.stat().st_size} B) — likely an error page.")
-    if not zipfile.is_zipfile(out_path):
-        out_path.unlink()
-        raise RuntimeError("Downloaded file is not a valid ZIP.")
-
-    print(f"  Saved: {out_path.name}  ({out_path.stat().st_size/1024:.1f} KB)")
-    return out_path
-
-
-def download_via_requests(dest_dir: Path) -> Path:
-    print("  [requests] Loading CMS page to establish session…")
-    session = requests.Session()
-    session.headers.update(BROWSER_HEADERS)
-    resp = session.get(CMS_PAGE_URL, timeout=30)
-    resp.raise_for_status()
-
-    zip_url = _find_zip_url_from_html(resp.text, CMS_PAGE_URL)
-    if not zip_url:
-        raise RuntimeError(
-            "ZIP link not found in page HTML — page likely requires JavaScript.\n"
-            "Use --auto which falls back to Selenium."
-        )
-    print(f"  [requests] ZIP URL: {zip_url}")
-    return _stream_download(session, zip_url, dest_dir)
-
-
-def download_via_selenium(dest_dir: Path) -> Path:
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.chrome.service import Service
-        from selenium.webdriver.common.by import By
-    except ImportError:
-        raise RuntimeError("Run: pip install selenium")
-
-    print("  [selenium] Launching headless Chrome…")
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1280,900")
-    opts.add_argument(f"--user-agent={BROWSER_HEADERS['User-Agent']}")
-
-    # Try webdriver-manager first (auto-downloads correct ChromeDriver for your Chrome version)
-    # Works on Windows, macOS, and Linux with no manual install needed.
-    # Install with: pip install webdriver-manager
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-        print("  [selenium] ChromeDriver auto-installed via webdriver-manager.")
-    except ImportError:
-        # webdriver-manager not installed, fall back to system ChromeDriver on PATH
-        try:
-            driver = webdriver.Chrome(options=opts)
-        except Exception as e:
-            raise RuntimeError(
-                f"ChromeDriver not found: {e}\n\n"
-                "Fix (easiest - works on Windows, Mac, Linux):\n"
-                "  pip install webdriver-manager\n\n"
-                "Or install ChromeDriver manually:\n"
-                "  Windows : https://chromedriver.chromium.org/downloads\n"
-                "            (place chromedriver.exe on your PATH)\n"
-                "  macOS   : brew install chromedriver\n"
-                "  Linux   : apt install chromium-driver"
-            )
-    except Exception as e:
-        raise RuntimeError(f"ChromeDriver failed to start: {e}")
-
-    zip_url = None
-    try:
-        driver.get(CMS_PAGE_URL)
-        time.sleep(4)   # let JS render
-        for link in driver.find_elements(By.TAG_NAME, "a"):
-            href = (link.get_attribute("href") or "").lower()
-            text = link.text.lower()
-            if href.endswith(".zip") and (
-                any(kw in href for kw in ["star-ratings-data-tables", "star_ratings_data_tables"])
-                or "star ratings data tables" in text
-            ):
-                zip_url = link.get_attribute("href")
-                print(f"  [selenium] Found: {zip_url}")
-                break
-        if not zip_url:
-            # broader fallback
-            for link in driver.find_elements(By.TAG_NAME, "a"):
-                href = (link.get_attribute("href") or "").lower()
-                if href.endswith(".zip") and "star" in href and "rating" in href:
-                    zip_url = link.get_attribute("href")
-                    break
-
-        if not zip_url:
-            raise RuntimeError(f"No ZIP link found on {CMS_PAGE_URL}")
-
-        cookies = driver.get_cookies()
-    finally:
-        driver.quit()
-
-    session = requests.Session()
-    session.headers.update(BROWSER_HEADERS)
-    session.headers["Referer"] = CMS_PAGE_URL
-    for c in cookies:
-        session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
-    return _stream_download(session, zip_url, dest_dir)
-
-
-def auto_download(dest_dir: Path) -> Path:
-    print("\n[AUTO-DOWNLOAD] Fetching from CMS…")
-    try:
-        return download_via_requests(dest_dir)
-    except Exception as e:
-        print(f"  requests failed: {e}")
-        print("  Falling back to Selenium…")
-        return download_via_selenium(dest_dir)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ZIP / PARSE HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _norm(name: str) -> str:
-    return re.sub(r"[_\-]+", " ", name.lower())
-
-
-def _find_in_zip(zip_path: str, keywords: list) -> str:
-    """Find a CSV or XLSX inside the ZIP whose name matches any keyword."""
-    with zipfile.ZipFile(zip_path) as z:
-        data_files = [n for n in z.namelist() 
-                      if n.lower().endswith(".xlsx") or n.lower().endswith(".csv")]
-    # Primary: keyword match on normalised filename
-    for name in data_files:
-        if any(kw in _norm(Path(name).name) for kw in keywords):
-            return name
-    # Fallback: keyword match anywhere in the full path
-    for name in data_files:
-        if any(kw in _norm(name) for kw in keywords):
-            return name
-    return None
-
-
-def _list_xlsx(zip_path: str) -> list:
-    """List all data files (CSV or XLSX) inside the ZIP."""
-    with zipfile.ZipFile(zip_path) as z:
-        return [n for n in z.namelist() 
-                if n.lower().endswith(".xlsx") or n.lower().endswith(".csv")]
-
-
-def _extract(zip_path: str, inner: str, dest: Path) -> Path:
-    with zipfile.ZipFile(zip_path) as z:
-        z.extract(inner, dest)
-    p = dest / inner
-    if not p.exists():
-        hits = list(dest.rglob(Path(inner).name))
-        p = hits[0] if hits else p
-    return p
-
-
-def _is_csv(path: Path) -> bool:
-    return path.suffix.lower() == ".csv"
-
-
-def _autowidth(ws, col_idx: int, max_w: int = 40):
-    col  = get_column_letter(col_idx)
-    best = max((len(str(ws.cell(row=r, column=col_idx).value or ""))
-                for r in range(1, min(ws.max_row + 1, 300))), default=8)
-    ws.column_dimensions[col].width = min(best + 2, max_w)
-
-
-def parse_file(xlsx_path: Path):
-    """
-    CMS header split:
-      Row 2, cols A-E  → fixed plan/contract headers
-      Row 3, cols F+   → measure name headers
-      Row 4            → reporting period (crosswalk only)
-      Row 5+           → data
-    Returns (data_df, crosswalk_df)
-    """
-    if _is_csv(xlsx_path):
-        raw = pd.read_csv(xlsx_path, header=None, nrows=6, dtype=str, encoding="utf-8-sig").fillna("")
-    else:
-        raw = (pd.read_csv(xlsx_path, header=None, nrows=6, dtype=str, encoding="utf-8-sig") if _is_csv(xlsx_path) else pd.read_excel(xlsx_path, header=None, nrows=6, dtype=str)).fillna("")
-
-    fixed = [str(v).strip() if str(v).strip() and str(v).lower() != "nan" else f"Field_{i+1}"
-             for i, v in enumerate(raw.iloc[1, :5])]
-
-    raw_meas   = [str(v).strip() for v in raw.iloc[2, 5:]]
-    raw_period = [str(v).strip() for v in raw.iloc[3, 5:]]
-
-    seen, meas_headers = {}, []
-    for h in raw_meas:
-        clean = h if h and h.lower() != "nan" else "Unknown"
-        cnt   = seen.get(clean, 0)
-        seen[clean] = cnt + 1
-        meas_headers.append(clean if cnt == 0 else f"{clean}_{cnt}")
-
-    all_headers = fixed + meas_headers
-    print(f"    Fixed headers : {fixed}")
-    print(f"    Measure cols  : {len(meas_headers)}")
-
-    cw_rows = [{"Column_Index": i + 6,
-                "Excel_Column": get_column_letter(i + 6),
-                "Measure_Name": orig if orig and orig.lower() != "nan" else "Unknown",
-                "Reporting_Period": p if p and p.lower() != "nan" else "Not Specified"}
-               for i, (orig, p) in enumerate(zip(raw_meas, raw_period))]
-    crosswalk_df = pd.DataFrame(cw_rows)
-
-    data_df = (pd.read_csv(xlsx_path, header=None, skiprows=4, dtype=str, encoding="utf-8-sig") if _is_csv(xlsx_path) else pd.read_excel(xlsx_path, header=None, skiprows=4, dtype=str)).fillna("")
-    if data_df.shape[1] > len(all_headers):
-        data_df = data_df.iloc[:, :len(all_headers)]
-    elif data_df.shape[1] < len(all_headers):
-        all_headers = all_headers[:data_df.shape[1]]
-    data_df.columns = all_headers
-    data_df = data_df[~data_df.apply(lambda r: r.str.strip().eq("").all(), axis=1)].reset_index(drop=True)
-    print(f"    Data rows     : {len(data_df)}")
-    return data_df, crosswalk_df
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  EXCEL WRITERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _data_sheet(wb, df: pd.DataFrame, label: str):
-    ws   = wb.active
-    ws.title = "Data"
-    span = min(len(df.columns), 8)
-    ws.append([f"CMS Star Ratings - {label}"] + [""] * (span - 1))
-    ws["A1"].font = TTL_FONT
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=span)
-    ws.row_dimensions[1].height = 20
-
-    ws.append(list(df.columns))
-    hr = ws.max_row
-    for cell in ws[hr]:
-        cell.font = HDR_FONT; cell.fill = HDR_FILL
-        cell.border = BORDER
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[hr].height = 24
-
-    for i, row in enumerate(df.itertuples(index=False)):
-        ws.append(list(row))
-        rn   = ws.max_row
-        fill = ALT_FILL if i % 2 == 1 else WHT_FILL
-        for cell in ws[rn]:
-            cell.font = BOD_FONT; cell.fill = fill
-            cell.border = BORDER; cell.alignment = Alignment(vertical="center")
-        ws.row_dimensions[rn].height = 15
-
-    ws.freeze_panes = "F3"
-    for ci in range(1, 6): _autowidth(ws, ci)
-    for ci in range(6, len(df.columns) + 1):
-        ws.column_dimensions[get_column_letter(ci)].width = 13
-
-
-def _cw_sheet(wb, cw_df: pd.DataFrame, label: str):
-    ws = wb.create_sheet("Measure Crosswalk")
-    ws.append([f"Measure Crosswalk - {label}"] + ["", "", ""])
-    ws["A1"].font = TTL_FONT
-    ws.merge_cells("A1:D1")
-    ws.row_dimensions[1].height = 20
-
-    ws.append(list(cw_df.columns))
-    hr = ws.max_row
-    for cell in ws[hr]:
-        cell.font = HDR_FONT; cell.fill = HDR_FILL
-        cell.border = BORDER; cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[hr].height = 22
-
-    for i, row in enumerate(cw_df.itertuples(index=False)):
-        ws.append(list(row))
-        rn = ws.max_row
-        fill = ALT_FILL if i % 2 == 1 else WHT_FILL
-        for cell in ws[rn]:
-            cell.font = BOD_FONT; cell.fill = fill
-            cell.border = BORDER; cell.alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[rn].height = 30
-
-    ws.freeze_panes = "A3"
-    ws.column_dimensions["A"].width = 14; ws.column_dimensions["B"].width = 14
-    ws.column_dimensions["C"].width = 60; ws.column_dimensions["D"].width = 32
-
-
-def write_output(df: pd.DataFrame, cw_df: pd.DataFrame, out_path: Path, label: str):
-    wb = openpyxl.Workbook()
-    _data_sheet(wb, df, label)
-    _cw_sheet(wb, cw_df, label)
-    wb.save(out_path)
-    print(f"  Saved: {out_path.name}  ({out_path.stat().st_size/1024:.1f} KB)")
-
-
-def write_combined_crosswalk(cw_data: pd.DataFrame, cw_stars: pd.DataFrame, out_path: Path):
-    wb = openpyxl.Workbook()
-    ws = wb.active; ws.title = "Combined Crosswalk"
-    ws.append(["CMS Star Ratings - Combined Measure Crosswalk"] + [""] * 5)
-    ws["A1"].font = TTL_FONT; ws.merge_cells("A1:F1"); ws.row_dimensions[1].height = 20
-
-    hdrs = ["Column_Index", "Excel_Column",
-            "Measure_Name (Data File)", "Reporting_Period (Data File)",
-            "Measure_Name (Stars File)", "Reporting_Period (Stars File)"]
-    ws.append(hdrs)
-    hr = ws.max_row
-    for cell in ws[hr]:
-        cell.font = HDR_FONT; cell.fill = HDR_FILL; cell.border = BORDER
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[hr].height = 30
-
-    for i in range(max(len(cw_data), len(cw_stars))):
-        d = cw_data.iloc[i].to_dict()  if i < len(cw_data)  else {}
-        s = cw_stars.iloc[i].to_dict() if i < len(cw_stars) else {}
-        ws.append([d.get("Column_Index",""), d.get("Excel_Column",""),
-                   d.get("Measure_Name",""), d.get("Reporting_Period",""),
-                   s.get("Measure_Name",""), s.get("Reporting_Period","")])
-        rn = ws.max_row; fill = ALT_FILL if i % 2 == 1 else WHT_FILL
-        for cell in ws[rn]:
-            cell.font = BOD_FONT; cell.fill = fill; cell.border = BORDER
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[rn].height = 30
-
-    ws.freeze_panes = "A3"
-    for col, w in zip("ABCDEF", [14, 14, 55, 32, 55, 32]):
-        ws.column_dimensions[col].width = w
-    wb.save(out_path)
-    print(f"  Saved: {out_path.name}  ({out_path.stat().st_size/1024:.1f} KB)")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SNOWFLAKE UPLOAD LAYER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _sf_safe_col(name: str) -> str:
-    """Convert a column name to a Snowflake-safe identifier."""
-    s = re.sub(r"[^A-Za-z0-9_]", "_", str(name).strip())
-    s = re.sub(r"_+", "_", s).strip("_")
-    if s and s[0].isdigit():
-        s = "COL_" + s
-    return s.upper() or "COL"
-
-
-def _df_to_snowflake_ddl(df: pd.DataFrame, table_name: str, db: str, schema: str) -> str:
-    """Generate a CREATE OR REPLACE TABLE DDL from a DataFrame."""
-    cols = []
-    for col in df.columns:
-        sf_col = _sf_safe_col(col)
-        cols.append(f'    "{sf_col}" VARCHAR')
-    col_defs = ",\n".join(cols)
-    return f'CREATE OR REPLACE TABLE "{db}"."{schema}"."{table_name}" (\n{col_defs}\n);'
-
-
-def _validate_sf_config(cfg: dict):
-    """Raise if any required Snowflake config key is missing."""
-    required = ["account", "user", "password", "warehouse", "database", "schema"]
-    missing  = [k for k in required if not cfg.get(k)]
-    if missing:
-        raise ValueError(
-            f"Missing Snowflake config: {missing}\n"
-            "Set environment variables or edit SNOWFLAKE_CONFIG in the script.\n"
-            "  export SNOWFLAKE_ACCOUNT='myorg-myaccount'\n"
-            "  export SNOWFLAKE_USER='my_user'\n"
-            "  export SNOWFLAKE_PASSWORD='my_password'\n"
-            "  export SNOWFLAKE_WAREHOUSE='MY_WH'\n"
-            "  export SNOWFLAKE_DATABASE='MY_DB'\n"
-            "  export SNOWFLAKE_SCHEMA='MY_SCHEMA'"
-        )
-
-
-def upload_df_to_snowflake(
-    df: pd.DataFrame,
-    table_name: str,
-    con,
-    db: str,
-    schema: str,
-):
-    """
-    Upload a DataFrame to Snowflake using write_pandas (fastest path).
-    Falls back to chunked INSERT if write_pandas isn't available.
-    Table is created or replaced automatically.
-    """
-    import snowflake.connector
-    from snowflake.connector.pandas_tools import write_pandas
-
-    # Rename columns to Snowflake-safe names
-    safe_cols = {col: _sf_safe_col(col) for col in df.columns}
-    df_upload = df.rename(columns=safe_cols).copy()
-
-    # Create table
-    ddl = _df_to_snowflake_ddl(df, table_name, db, schema)
-    cur = con.cursor()
-    try:
-        cur.execute(f'USE DATABASE "{db}"')
-        cur.execute(f'USE SCHEMA "{schema}"')
-        cur.execute(ddl)
-        print(f"    Table created/replaced: {db}.{schema}.{table_name}")
-
-        # Upload via write_pandas (uses PUT + COPY INTO — very fast)
-        success, nchunks, nrows, _ = write_pandas(
-            conn=con,
-            df=df_upload,
-            table_name=table_name,
-            database=db,
-            schema=schema,
-            overwrite=True,
-            quote_identifiers=True,
-            auto_create_table=False,
-        )
-        if success:
-            print(f"    Uploaded {nrows:,} rows in {nchunks} chunk(s)")
-        else:
-            raise RuntimeError("write_pandas returned failure status")
-    finally:
-        cur.close()
-
-
-def snowflake_upload(results: dict, crosswalks: dict):
-    """Upload all three datasets to Snowflake."""
-    print(f"\n{SEP}")
-    print("  SNOWFLAKE UPLOAD")
-    print(SEP)
-
-    _validate_sf_config(SNOWFLAKE_CONFIG)
-
-    try:
-        import snowflake.connector
-    except ImportError:
-        raise RuntimeError("Run: pip install snowflake-connector-python[pandas]")
-
-    cfg = SNOWFLAKE_CONFIG
-    db     = cfg["database"].upper()
-    schema = cfg["schema"].upper()
-
-    # Build connection kwargs
-    conn_kwargs = {
-        "account"  : cfg["account"],
-        "user"     : cfg["user"],
-        "password" : cfg["password"],
-        "warehouse": cfg["warehouse"],
-        "database" : db,
-        "schema"   : schema,
-        "session_parameters": {"QUERY_TAG": "CMS_Star_Ratings_Processor"},
-    }
-    if cfg.get("role"):
-        conn_kwargs["role"] = cfg["role"]
-
-    print(f"  Connecting to Snowflake…")
-    print(f"    Account  : {cfg['account']}")
-    print(f"    Database : {db}")
-    print(f"    Schema   : {schema}")
-    print(f"    Warehouse: {cfg['warehouse']}")
-    if cfg.get("role"):
-        print(f"    Role     : {cfg['role']}")
-
-    con = snowflake.connector.connect(**conn_kwargs)
-    try:
-        cur = con.cursor()
-        cur.execute(f'USE WAREHOUSE "{cfg["warehouse"]}"')
-        cur.close()
-        print("  Connection successful.\n")
-
-        # Upload Measure Data
-        if "Measure Data" in results:
-            print(f"  Uploading {SF_TABLE_DATA}…")
-            upload_df_to_snowflake(results["Measure Data"], SF_TABLE_DATA, con, db, schema)
-
-        # Upload Measure Stars
-        if "Measure Stars" in results:
-            print(f"\n  Uploading {SF_TABLE_STARS}…")
-            upload_df_to_snowflake(results["Measure Stars"], SF_TABLE_STARS, con, db, schema)
-
-        # Upload combined crosswalk
-        if len(crosswalks) == 2:
-            print(f"\n  Uploading {SF_TABLE_CROSSWALK}…")
-            # Build combined crosswalk DataFrame
-            cw_data  = crosswalks["Measure Data"]
-            cw_stars = crosswalks["Measure Stars"]
-            n = max(len(cw_data), len(cw_stars))
-            cw_combined = pd.DataFrame([{
-                "Column_Index"              : cw_data.iloc[i]["Column_Index"]   if i < len(cw_data)  else "",
-                "Excel_Column"              : cw_data.iloc[i]["Excel_Column"]   if i < len(cw_data)  else "",
-                "Measure_Name_Data"         : cw_data.iloc[i]["Measure_Name"]   if i < len(cw_data)  else "",
-                "Reporting_Period_Data"     : cw_data.iloc[i]["Reporting_Period"] if i < len(cw_data) else "",
-                "Measure_Name_Stars"        : cw_stars.iloc[i]["Measure_Name"]  if i < len(cw_stars) else "",
-                "Reporting_Period_Stars"    : cw_stars.iloc[i]["Reporting_Period"] if i < len(cw_stars) else "",
-            } for i in range(n)])
-            upload_df_to_snowflake(cw_combined, SF_TABLE_CROSSWALK, con, db, schema)
-
-        elif "Measure Data" in crosswalks:
-            print(f"\n  Uploading {SF_TABLE_CROSSWALK} (Data only)…")
-            upload_df_to_snowflake(crosswalks["Measure Data"], SF_TABLE_CROSSWALK, con, db, schema)
-
-        print(f"\n  All tables loaded successfully into {db}.{schema}")
-
-    finally:
-        con.close()
-
-    # Print quick-start queries
-    print(f"""
-  Quick-start queries:
-  ───────────────────────────────────────────────────────────
-  -- Preview data
-  SELECT * FROM "{db}"."{schema}"."{SF_TABLE_DATA}" LIMIT 10;
-  SELECT * FROM "{db}"."{schema}"."{SF_TABLE_STARS}" LIMIT 10;
-
-  -- Crosswalk lookup
-  SELECT * FROM "{db}"."{schema}"."{SF_TABLE_CROSSWALK}";
-
-  -- Join data + crosswalk
-  SELECT d.*, c."MEASURE_NAME_DATA", c."REPORTING_PERIOD_DATA"
-  FROM   "{db}"."{schema}"."{SF_TABLE_DATA}" d
-  JOIN   "{db}"."{schema}"."{SF_TABLE_CROSSWALK}" c
-    ON   d."CONTRACT_ID" IS NOT NULL   -- replace with real join key
-  LIMIT 20;
-  ───────────────────────────────────────────────────────────
-""")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PROCESS ZIP
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_zip(zip_path: Path):
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    # Use system temp dir for extraction to avoid OneDrive/permission issues
-    import tempfile as _tempfile
-    _tmp_holder = _tempfile.TemporaryDirectory(prefix="cms_stars_extract_")
-    extract_dir = Path(_tmp_holder.name)
-
-    print(f"\n{SEP}")
-    print("  CMS Star Ratings Data Tables Processor")
-    print(SEP)
-    print(f"  ZIP   : {zip_path}")
-    print(f"  Output: {OUTPUT_DIR.resolve()}\n")
-
-    print("[1/5] Scanning ZIP…")
-    all_xlsx = _list_xlsx(str(zip_path))
-    print(f"  Found {len(all_xlsx)} .xlsx file(s):")
-    for x in all_xlsx: print(f"    {x}")
-
-    data_inner  = _find_in_zip(str(zip_path), MEASURE_DATA_KEYWORDS)
-    stars_inner = _find_in_zip(str(zip_path), MEASURE_STARS_KEYWORDS)
-    if not data_inner:  print(f"\n  WARNING: Measure Data not found  (keywords: {MEASURE_DATA_KEYWORDS})")
-    if not stars_inner: print(f"\n  WARNING: Measure Stars not found (keywords: {MEASURE_STARS_KEYWORDS})")
-    if not data_inner and not stars_inner:
-        print("\nERROR: No files matched. Edit keyword constants at top of script.")
-        sys.exit(1)
-    print(f"\n  Measure Data  -> {data_inner  or 'NOT FOUND'}")
-    print(f"  Measure Stars -> {stars_inner or 'NOT FOUND'}")
-
-    print("\n[2/5] Extracting…")
-    extracted = {}
-    for label, inner in [("Measure Data", data_inner), ("Measure Stars", stars_inner)]:
-        if inner:
-            p = _extract(str(zip_path), inner, extract_dir)
-            extracted[label] = p
-            print(f"  {label}: {p.name}")
-
-    print("\n[3/5] Parsing…")
-    results, crosswalks = {}, {}
-    for label, path in extracted.items():
-        print(f"  {label}:")
-        df, cw = parse_file(path)
-        results[label] = df; crosswalks[label] = cw
-
-    print("\n[4/5] Writing Excel outputs…")
-    if "Measure Data" in results:
-        write_output(results["Measure Data"], crosswalks["Measure Data"],
-                     OUTPUT_DIR / "star_ratings_measure_data.xlsx",
-                     "Star Ratings Data Table - Measure Data")
-    if "Measure Stars" in results:
-        write_output(results["Measure Stars"], crosswalks["Measure Stars"],
-                     OUTPUT_DIR / "star_ratings_measure_stars.xlsx",
-                     "Star Ratings Data Table - Measure Stars")
-    if len(crosswalks) == 2:
-        write_combined_crosswalk(crosswalks["Measure Data"], crosswalks["Measure Stars"],
-                                 OUTPUT_DIR / "star_ratings_measure_crosswalk_combined.xlsx")
-
-    print(f"\n[5/5] Excel output complete.")
-    print(f"\n  Files in {OUTPUT_DIR.resolve()}:")
-    for f in sorted(OUTPUT_DIR.glob("*.xlsx")):
-        print(f"    {f.name}  ({f.stat().st_size/1024:.1f} KB)")
-
-    return results, crosswalks
-
-
-def load_existing_outputs() -> tuple:
-    """Load previously processed Excel outputs from disk (for --upload --no-process)."""
-    results, crosswalks = {}, {}
-    data_path  = OUTPUT_DIR / "star_ratings_measure_data.xlsx"
-    stars_path = OUTPUT_DIR / "star_ratings_measure_stars.xlsx"
-
-    if data_path.exists():
-        print(f"  Loading existing: {data_path.name}")
-        df = pd.read_excel(data_path, sheet_name="Data", header=1, dtype=str).fillna("")
-        # Drop the merged title row if it snuck in
-        df = df[~df.apply(lambda r: r.str.strip().eq("").all(), axis=1)].iloc[1:].reset_index(drop=True)
-        # Also reload crosswalk
-        cw = pd.read_excel(data_path, sheet_name="Measure Crosswalk", header=1, dtype=str).fillna("")
-        cw = cw[~cw.apply(lambda r: r.str.strip().eq("").all(), axis=1)].iloc[1:].reset_index(drop=True)
-        results["Measure Data"]    = df
-        crosswalks["Measure Data"] = cw
-
-    if stars_path.exists():
-        print(f"  Loading existing: {stars_path.name}")
-        df = pd.read_excel(stars_path, sheet_name="Data", header=1, dtype=str).fillna("")
-        df = df[~df.apply(lambda r: r.str.strip().eq("").all(), axis=1)].iloc[1:].reset_index(drop=True)
-        cw = pd.read_excel(stars_path, sheet_name="Measure Crosswalk", header=1, dtype=str).fillna("")
-        cw = cw[~cw.apply(lambda r: r.str.strip().eq("").all(), axis=1)].iloc[1:].reset_index(drop=True)
-        results["Measure Stars"]    = df
-        crosswalks["Measure Stars"] = cw
-
-    if not results:
-        raise FileNotFoundError(
-            f"No processed output files found in {OUTPUT_DIR}.\n"
-            "Run without --no-process first to generate them."
-        )
-    return results, crosswalks
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MA CONTRACT DIRECTORY UPLOAD
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_ma_directory(xlsx_path: Path, con, db: str, schema: str):
-    """
-    Read MA_Contract_directory_2026_04.xlsx:
-      - Row 1 = headers (spaces replaced with underscores, uppercased)
-      - Upload to Snowflake table MA_CONTRACT_DIRECTORY_2026_04
-    """
-    from snowflake.connector.pandas_tools import write_pandas
-
-    print(f"\n  Reading: {xlsx_path.name}")
-    df = pd.read_excel(xlsx_path, header=0, dtype=str).fillna("")
-
-    # Clean column names: spaces -> underscores, uppercase
-    df.columns = [re.sub(r"\s+", "_", c.strip()).upper() for c in df.columns]
-    # Also remove any special characters
-    df.columns = [re.sub(r"[^A-Z0-9_]", "", c) for c in df.columns]
-
-    print(f"  Columns  : {list(df.columns)}")
-    print(f"  Rows     : {len(df)}")
-
-    table_name = "MA_CONTRACT_DIRECTORY_2026_04"
-
-    # Build DDL
-    col_defs = ",\n".join([f'    "{c}" VARCHAR' for c in df.columns])
-    ddl = f'CREATE OR REPLACE TABLE "{db}"."{schema}"."{table_name}" (\n{col_defs}\n);' 
-
-    cur = con.cursor()
-    try:
-        cur.execute(f'USE DATABASE "{db}"')
-        cur.execute(f'USE SCHEMA "{schema}"')
-        cur.execute(ddl)
-        print(f"  Table created: {db}.{schema}.{table_name}")
-
-        success, nchunks, nrows, _ = write_pandas(
-            conn=con, df=df, table_name=table_name,
-            database=db, schema=schema,
-            overwrite=True, quote_identifiers=True,
-            auto_create_table=False,
-        )
-        if success:
-            print(f"  Uploaded {nrows:,} rows in {nchunks} chunk(s)")
-        else:
-            raise RuntimeError("write_pandas failed")
-    finally:
-        cur.close()
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PART C / PART D CUT POINTS UPLOAD
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_cut_points(zip_path: Path, con, db: str, schema: str):
-    """
-    Read Part C and Part D Cut Points CSVs from ZIP.
-
-    Structure:
-      Row 1: Table title (skip)
-      Row 2: Domain headers (skip)
-      Row 3: A3="Measure_Name" + measure name headers for cols B+
-      Row 4: A4="Reporting_Period" + reporting period per measure (crosswalk)
-      Row 5+: Data rows (1star, 2star, 3star, 4star, 5star)
-    """
-    import io
-    from snowflake.connector.pandas_tools import write_pandas
-
-    targets = [
-        (CUTPOINT_C_KEYWORDS, "STAR_RATINGS_PART_C_CUT_POINTS"),
-        (CUTPOINT_D_KEYWORDS, "STAR_RATINGS_PART_D_CUT_POINTS"),
-    ]
-
-    for keywords, table_name in targets:
-        inner = _find_in_zip(str(zip_path), keywords)
-        if not inner:
-            print(f"  WARNING: Could not find file for {table_name}")
-            continue
-
-        print(f"\n  Processing: {inner} -> {table_name}")
-
-        with zipfile.ZipFile(str(zip_path)) as z:
-            raw_bytes = z.read(inner)
-
-        # Read first 6 rows raw to inspect structure
-        raw = pd.read_csv(
-            io.BytesIO(raw_bytes), header=None, nrows=6,
-            dtype=str, encoding="utf-8-sig"
-        ).fillna("")
-
-        # Row 3 (index 2) = headers
-        # A3 = "Measure_Name", B3+ = measure names
-        headers = []
-        for i, v in enumerate(raw.iloc[2]):
-            s = str(v).strip()
-            if i == 0:
-                headers.append("Measure_Name")
-            else:
-                headers.append(s if s and s.lower() != "nan" else f"Measure_{i}")
-
-        # Row 4 (index 3) = reporting periods per measure (for crosswalk)
-        reporting = []
-        for i, v in enumerate(raw.iloc[3]):
-            s = str(v).strip()
-            if i == 0:
-                reporting.append("Reporting_Period")
-            else:
-                reporting.append(s if s and s.lower() != "nan" else "")
-
-        print(f"  Headers sample : {headers[:5]}")
-        print(f"  Reporting sample: {reporting[:5]}")
-
-        # Read data rows — skip first 4 rows (title, domain, header, reporting period)
-        data_df = pd.read_csv(
-            io.BytesIO(raw_bytes), header=None, skiprows=4,
-            dtype=str, encoding="utf-8-sig"
-        ).fillna("")
-
-        # Trim/pad columns to match headers
-        if data_df.shape[1] > len(headers):
-            data_df = data_df.iloc[:, :len(headers)]
-        elif data_df.shape[1] < len(headers):
-            headers = headers[:data_df.shape[1]]
-
-        data_df.columns = headers
-
-        # Drop fully blank rows
-        data_df = data_df[
-            ~data_df.apply(lambda r: r.str.strip().eq("").all(), axis=1)
-        ].reset_index(drop=True)
-
-        print(f"  Data rows : {len(data_df)}")
-
-        # Upload to Snowflake
-        safe_cols = {col: _sf_safe_col(col) for col in data_df.columns}
-        df_upload = data_df.rename(columns=safe_cols)
-
-        col_defs = ",\n".join([f'    "{c}" VARCHAR' for c in df_upload.columns])
-        ddl = f'CREATE OR REPLACE TABLE "{db}"."{schema}"."{table_name}" (\n{col_defs}\n);' 
-
-        cur = con.cursor()
-        try:
-            cur.execute(f'USE DATABASE "{db}"')
-            cur.execute(f'USE SCHEMA "{schema}"')
-            cur.execute(ddl)
-            print(f"  Table created: {db}.{schema}.{table_name}")
-
-            success, nchunks, nrows, _ = write_pandas(
-                conn=con, df=df_upload, table_name=table_name,
-                database=db, schema=schema,
-                overwrite=True, quote_identifiers=True,
-                auto_create_table=False,
-            )
-            if success:
-                print(f"  Uploaded {nrows:,} rows in {nchunks} chunk(s)")
-            else:
-                raise RuntimeError("write_pandas failed")
-        finally:
-            cur.close()
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  AD-HOC CAP SUMMARY REPORT UPLOAD
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_cap_summary(html_path: Path, con, db: str, schema: str):
-    """
-    Parse Ad-Hoc CAP Summary Report HTML:
-      - Splits Contract ID from Contract Name into separate columns
-      - Expands multiple contracts per row into individual rows
-      - Replaces spaces with underscores in all column headers
-      - Uploads to ADHOC_CAP_SUMMARY table in Snowflake
-    """
-    from bs4 import BeautifulSoup
-    from snowflake.connector.pandas_tools import write_pandas
-    import pandas as pd
-
-    print(f"\n  Reading: {html_path.name}")
-
-    with open(html_path, "r", encoding="utf-8") as f:
-        soup = BeautifulSoup(f.read(), "html.parser")
-
-    rows = soup.find_all("tr", align="left")
-    records = []
-
-    for row in rows:
-        cells = row.find_all("td")
-        if len(cells) < 10:
-            continue
-
-        cell_text = cells[0].get_text(separator="\n").strip()
-        contract_entries = [line.strip() for line in cell_text.split("\n") if line.strip()]
-
-        parsed_contracts = []
-        for entry in contract_entries:
-            if " - " in entry:
-                parts = entry.split(" - ", 1)
-                parsed_contracts.append((parts[0].strip(), parts[1].strip()))
-            elif entry:
-                parsed_contracts.append((entry.strip(), ""))
-
-        parent_org    = cells[1].get_text(strip=True)
-        contact_name  = cells[2].get_text(strip=True)
-        contact_phone = cells[3].get_text(strip=True)
-        issue_id      = cells[4].get_text(strip=True)
-        date_sent     = cells[5].get_text(strip=True)
-        issue_type    = cells[6].get_text(strip=True)
-        issue_topic   = cells[7].get_text(strip=True)
-        issue_summary = cells[8].get_text(strip=True)
-        letter_name   = cells[9].get_text(strip=True)
-
-        for contract_id, contract_name in parsed_contracts:
-            records.append([
-                contract_id, contract_name,
-                parent_org, contact_name, contact_phone,
-                issue_id, date_sent, issue_type,
-                issue_topic, issue_summary, letter_name
-            ])
-
-    headers = [
-        "Contract_ID", "Contract_Name",
-        "Parent_Organization_Name", "Organization_Contact_Name",
-        "Organization_Contact_Phone", "Compliance_Issue_ID",
-        "Date_Letter_Sent", "Issue_Type",
-        "Issue_Topic", "Issue_Summary", "Letter_Name"
-    ]
-
-    df = pd.DataFrame(records, columns=headers)
-    print(f"  Records  : {len(df)}")
-    print(f"  Columns  : {list(df.columns)}")
-
-    table_name = "ADHOC_CAP_SUMMARY"
-    col_defs = ",\n".join([f'    "{c}" VARCHAR' for c in df.columns])
-    ddl = f'CREATE OR REPLACE TABLE "{db}"."{schema}"."{table_name}" (\n{col_defs}\n);'
-
-    cur = con.cursor()
-    try:
-        cur.execute(f'USE DATABASE "{db}"')
-        cur.execute(f'USE SCHEMA "{schema}"')
-        cur.execute(ddl)
-        print(f"  Table created: {db}.{schema}.{table_name}")
-
-        success, nchunks, nrows, _ = write_pandas(
-            conn=con, df=df, table_name=table_name,
-            database=db, schema=schema,
-            overwrite=True, quote_identifiers=True,
-            auto_create_table=False,
-        )
-        if success:
-            print(f"  Uploaded {nrows:,} rows in {nchunks} chunk(s)")
-        else:
-            raise RuntimeError("write_pandas failed")
-    finally:
-        cur.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  GENERIC CMS CSV TABLE UPLOAD (Row 1 = skip, Row 2 = headers)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Table configs: (keyword, snowflake_table_name)
-EXTRA_TABLES = [
-    (["cai"],                         "STAR_RATINGS_CAI"),
-    (["domain stars", "domain star"], "STAR_RATINGS_DOMAIN_STARS"),
-    (["summary ratings"],             "STAR_RATINGS_SUMMARY_RATINGS"),
-    (["high performing"],             "STAR_RATINGS_HIGH_PERFORMING_CONTRACTS"),
-    (["low performing"],              "STAR_RATINGS_LOW_PERFORMING_CONTRACTS"),
-]
-
-
-def upload_generic_csv(zip_path: Path, keywords: list, table_name: str,
-                       con, db: str, schema: str):
-    """
-    Upload a CMS CSV file from ZIP where:
-      Row 1 = table title (skip)
-      Row 2 = headers (spaces -> underscores, trimmed, uppercased)
-      Row 3+ = data
-    """
-    import io
-    from snowflake.connector.pandas_tools import write_pandas
-
-    inner = _find_in_zip(str(zip_path), keywords)
-    if not inner:
-        print(f"  WARNING: Could not find file for {table_name} (keywords: {keywords})")
-        return
-
-    print(f"\n  Processing: {Path(inner).name}")
-    print(f"  Target table: {table_name}")
-
-    with zipfile.ZipFile(str(zip_path)) as z:
-        raw_bytes = z.read(inner)
-
-    # Read row 2 (index 1) as headers
-    header_row = pd.read_csv(
-        io.BytesIO(raw_bytes), header=None, skiprows=1, nrows=1,
-        dtype=str, encoding="utf-8-sig"
-    ).fillna("").iloc[0].tolist()
-
-    # Clean headers: trim, spaces -> underscores, uppercase, remove special chars
-    clean_headers = []
-    seen = {}
-    for h in header_row:
-        h = str(h).strip()
-        h = re.sub(r"\s+", "_", h)
-        h = re.sub(r"[^A-Za-z0-9_]", "", h).upper()
-        h = h if h else "COL"
-        cnt = seen.get(h, 0)
-        seen[h] = cnt + 1
-        clean_headers.append(h if cnt == 0 else f"{h}_{cnt}")
-
-    print(f"  Headers ({len(clean_headers)}): {clean_headers[:6]}...")
-
-    # Read data rows (skip row 1 title + row 2 headers = skip 2 rows)
-    data_df = pd.read_csv(
-        io.BytesIO(raw_bytes), header=None, skiprows=2,
-        dtype=str, encoding="utf-8-sig"
-    ).fillna("")
-
-    # Trim/pad columns
-    if data_df.shape[1] > len(clean_headers):
-        data_df = data_df.iloc[:, :len(clean_headers)]
-    elif data_df.shape[1] < len(clean_headers):
-        clean_headers = clean_headers[:data_df.shape[1]]
-
-    data_df.columns = clean_headers
-
-    # Drop fully blank rows
-    data_df = data_df[
-        ~data_df.apply(lambda r: r.str.strip().eq("").all(), axis=1)
-    ].reset_index(drop=True)
-
-    print(f"  Rows: {len(data_df)}")
-
-    # Upload to Snowflake
-    col_defs = ",\n".join([f'    "{c}" VARCHAR' for c in data_df.columns])
-    ddl = f'CREATE OR REPLACE TABLE "{db}"."{schema}"."{table_name}" (\n{col_defs}\n);'
-
-    cur = con.cursor()
-    try:
-        cur.execute(f'USE DATABASE "{db}"')
-        cur.execute(f'USE SCHEMA "{schema}"')
-        cur.execute(ddl)
-        print(f"  Table created: {db}.{schema}.{table_name}")
-
-        success, nchunks, nrows, _ = write_pandas(
-            conn=con, df=data_df, table_name=table_name,
-            database=db, schema=schema,
-            overwrite=True, quote_identifiers=True,
-            auto_create_table=False,
-        )
-        if success:
-            print(f"  Uploaded {nrows:,} rows in {nchunks} chunk(s)")
-        else:
-            raise RuntimeError("write_pandas failed")
-    finally:
-        cur.close()
-
-
-def process_extra_tables(zip_path: Path, con, db: str, schema: str):
-    """Upload all 5 extra CMS tables: CAI, Domain Stars, Summary Ratings,
-    High Performing, Low Performing Contracts."""
-    for keywords, table_name in EXTRA_TABLES:
-        upload_generic_csv(zip_path, keywords, table_name, con, db, schema)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  2027 STAR RATINGS MEASURES UPLOAD (Table 1 Part C + Table 2 Part D)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_star_measures(zip_path: Path, con, db: str, schema: str):
-    """
-    Upload 2027 Star Ratings measure tables from ZIP:
-      - 2027_Star_Ratings_Table1_Part_C.xlsx  -> STAR_RATINGS_2027_PART_C_MEASURES
-      - 2027_Star_Ratings_Table2_Part_D.xlsx  -> STAR_RATINGS_2027_PART_D_MEASURES
-    Row 1 = title (skip), Row 2 = headers
-    Headers: spaces -> underscores, trimmed, uppercased
-    Weight column stored as number
-    """
-    import io
-    from snowflake.connector.pandas_tools import write_pandas
-
-    targets = [
-        (["table1", "part_c", "part c"], "STAR_RATINGS_2027_PART_C_MEASURES"),
-        (["table2", "part_d", "part d"], "STAR_RATINGS_2027_PART_D_MEASURES"),
-    ]
-
-    with zipfile.ZipFile(str(zip_path)) as z:
-        all_files = z.namelist()
-
-    for keywords, table_name in targets:
-        # Find matching file
-        inner = None
-        for fname in all_files:
-            norm = _norm(Path(fname).name)
-            if any(kw in norm for kw in keywords):
-                inner = fname
-                break
-
-        if not inner:
-            print(f"  WARNING: Could not find file for {table_name}")
-            print(f"  Files in ZIP: {all_files}")
-            continue
-
-        print(f"\n  Processing: {Path(inner).name}")
-        print(f"  Target table: {table_name}")
-
-        with zipfile.ZipFile(str(zip_path)) as z:
-            raw_bytes = z.read(inner)
-
-        # Row 2 (index 1) = headers, skip row 1 (title)
-        df = pd.read_excel(
-            io.BytesIO(raw_bytes), header=1, dtype=str
-        ).fillna("")
-
-        # Clean headers: trim, spaces -> underscores, uppercase
-        df.columns = [
-            re.sub(r"[^A-Z0-9_]", "", re.sub(r"\s+", "_", str(c).strip())).upper()
-            for c in df.columns
-        ]
-
-        # Trim all string fields
-        for col in df.columns:
-            df[col] = df[col].str.strip()
-
-        # Convert weight column to numeric
-        weight_cols = [c for c in df.columns if "WEIGHT" in c]
-        for wc in weight_cols:
-            df[wc] = pd.to_numeric(df[wc], errors="coerce").fillna(0).astype(int).astype(str)
-
-        # Drop fully blank rows
-        df = df[~df.apply(lambda r: r.str.strip().eq("").all(), axis=1)].reset_index(drop=True)
-
-        print(f"  Columns : {list(df.columns)}")
-        print(f"  Rows    : {len(df)}")
-
-        # Upload
-        col_defs = ",\n".join([f'    "{c}" VARCHAR' for c in df.columns])
-        ddl = f'CREATE OR REPLACE TABLE "{db}"."{schema}"."{table_name}" (\n{col_defs}\n);'
-
-        cur = con.cursor()
-        try:
-            cur.execute(f'USE DATABASE "{db}"')
-            cur.execute(f'USE SCHEMA "{schema}"')
-            cur.execute(ddl)
-            print(f"  Table created: {db}.{schema}.{table_name}")
-
-            success, nchunks, nrows, _ = write_pandas(
-                conn=con, df=df, table_name=table_name,
-                database=db, schema=schema,
-                overwrite=True, quote_identifiers=True,
-                auto_create_table=False,
-            )
-            if success:
-                print(f"  Uploaded {nrows:,} rows in {nchunks} chunk(s)")
-            else:
-                raise RuntimeError("write_pandas failed")
-        finally:
-            cur.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CAP INFO TABLE UPLOAD (from Excel file)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_cap_info(xlsx_path: Path, con, db: str, schema: str):
-    """
-    Upload CAP letter contact info from Excel to Snowflake CAP_INFO table.
-    Maps: Source File -> FILE_NAME, Recipient Name -> RECIPIENT_NAME,
-          Email Address -> EMAIL, Date of Letter -> DATE_OF_LETTER,
-          Contract ID -> CONTRACT_ID, Issue Type -> SUMMARY
-    """
-    import io
-    from snowflake.connector.pandas_tools import write_pandas
-    import pandas as pd
-
-    print(f"\n  Reading: {xlsx_path.name}")
-
-    df = pd.read_excel(str(xlsx_path), header=1, dtype=str).fillna("")
-
-    # Map columns to Snowflake field names
-    df = df.rename(columns={
-        "Source File":       "FILE_NAME",
-        "Recipient Name":    "RECIPIENT_NAME",
-        "Email Address":     "EMAIL",
-        "Date of Letter":    "DATE_OF_LETTER",
-        "Contract ID":       "CONTRACT_ID",
-        "Issue Type":        "SUMMARY",
-    })
-
-    # Keep only target columns
-    keep = ["FILE_NAME","RECIPIENT_NAME","EMAIL","DATE_OF_LETTER","CONTRACT_ID","SUMMARY"]
-    df = df[[c for c in keep if c in df.columns]]
-
-    # Clean — trim all fields
-    for col in df.columns:
-        df[col] = df[col].str.strip()
-
-    # Drop blank rows
-    df = df[df["CONTRACT_ID"].str.strip().ne("")].reset_index(drop=True)
-
-    print(f"  Records : {len(df)}")
-    print(f"  Columns : {list(df.columns)}")
-
-    table_name = "CAP_INFO"
-    col_defs = ",\n".join([
-        f'    "FILE_NAME"      VARCHAR',
-        f'    "RECIPIENT_NAME" VARCHAR',
-        f'    "EMAIL"          VARCHAR',
-        f'    "DATE_OF_LETTER" VARCHAR',
-        f'    "CONTRACT_ID"    VARCHAR',
-        f'    "SUMMARY"        VARCHAR',
-    ])
-    ddl = f'CREATE OR REPLACE TABLE "{db}"."{schema}"."{table_name}" (\n{col_defs}\n);'
-
-    cur = con.cursor()
-    try:
-        cur.execute(f'USE DATABASE "{db}"')
-        cur.execute(f'USE SCHEMA "{schema}"')
-        cur.execute(ddl)
-        print(f"  Table created: {db}.{schema}.{table_name}")
-
-        success, nchunks, nrows, _ = write_pandas(
-            conn=con, df=df, table_name=table_name,
-            database=db, schema=schema,
-            overwrite=True, quote_identifiers=True,
-            auto_create_table=False,
-        )
-        if success:
-            print(f"  Uploaded {nrows:,} rows in {nchunks} chunk(s)")
-        else:
-            raise RuntimeError("write_pandas failed")
-    finally:
-        cur.close()
-
-def run_setup():
-    """Interactive wizard to save Snowflake credentials to config.json."""
-    import json, getpass
-    config_path = Path(__file__).parent / "config.json"
-
-    print()
-    print("=" * 62)
-    print("  Snowflake Credentials Setup")
-    print("=" * 62)
-    print(f"  Credentials will be saved to: {config_path}")
-    print("  Press Enter to keep existing value shown in [ ].")
-    print()
-
-    # Load existing config if present
-    existing = {}
-    if config_path.exists():
-        try:
-            with open(config_path) as f:
-                existing = json.load(f)
-        except Exception:
-            pass
-
-    def _prompt(label, key, secret=False):
-        current = existing.get(key, "")
-        display = ("*" * min(len(current), 8)) if (secret and current) else current
-        prompt_str = f"  {label} [{display}]: "
-        val = getpass.getpass(prompt_str) if secret else input(prompt_str)
-        return val.strip() if val.strip() else current
-
-    cfg = {
-        "account"  : _prompt("Snowflake Account  (e.g. myorg-myaccount)", "account"),
-        "user"     : _prompt("Snowflake Username", "user"),
-        "password" : _prompt("Snowflake Password", "password", secret=True),
-        "warehouse": _prompt("Warehouse          (e.g. COMPUTE_WH)", "warehouse"),
-        "database" : _prompt("Database           (e.g. HCE_DB)", "database"),
-        "schema"   : _prompt("Schema             (e.g. STAR_RATINGS)", "schema"),
-        "role"     : _prompt("Role               (optional, press Enter to skip)", "role"),
-    }
-
-    with open(config_path, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-    print()
-    print(f"  Credentials saved to {config_path}")
-    print("  You can re-run --setup anytime to update them.")
-    print("=" * 62)
-    print()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Download, process, and upload CMS Star Ratings Data Tables to Snowflake",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Auto-download + process + upload
-  py -3.11 process_star_ratings.py --auto --upload
-
-  # Use existing ZIP + upload
-  py -3.11 process_star_ratings.py --zip ~/Downloads/2026-star-ratings-data-tables.zip --upload
-
-  # Upload only (re-use previously processed outputs)
-  py -3.11 process_star_ratings.py --upload --no-process
-
-Snowflake config (env vars or edit SNOWFLAKE_CONFIG in script):
-  export SNOWFLAKE_ACCOUNT="myorg-myaccount"
-  export SNOWFLAKE_USER="my_user"
-  export SNOWFLAKE_PASSWORD="my_password"
-  export SNOWFLAKE_WAREHOUSE="MY_WH"
-  export SNOWFLAKE_DATABASE="MY_DB"
-  export SNOWFLAKE_SCHEMA="MY_SCHEMA"
-  export SNOWFLAKE_ROLE="MY_ROLE"     # optional
-        """
+import snowflake.connector
+import json
+
+st.set_page_config(page_title="MA Intelligence Hub", page_icon="★", layout="wide")
+
+st.markdown("""
+<style>
+[data-testid="stMetricValue"] { font-size:1.8rem; color:#1F4E79; font-weight:600; }
+[data-testid="stMetricLabel"] { font-size:0.72rem; color:#666; }
+.section-header { font-size:1.05rem; font-weight:600; color:#1F4E79;
+    border-bottom:2px solid #1F4E79; padding-bottom:4px; margin:0.8rem 0 0.5rem; }
+.filter-box { background:#F0F4F8; border-radius:8px; padding:12px; margin-bottom:12px; }
+</style>""", unsafe_allow_html=True)
+
+st.title("★ MA Intelligence Hub")
+st.caption("Star Ratings · CAP Enforcement · Low Performers · Measure Performance · Enrollment · Contract Directory")
+st.markdown("<div style='text-align:right; font-size:11px; color:#999; margin-top:-10px;'>Built by <b>Sadaf Pasha</b></div>", unsafe_allow_html=True)
+
+# ── CONNECTION ────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_connection():
+    return snowflake.connector.connect(
+        account          = st.secrets["snowflake"]["account"],
+        user             = st.secrets["snowflake"]["user"],
+        password         = st.secrets["snowflake"]["password"],
+        warehouse        = st.secrets["snowflake"]["warehouse"],
+        database         = st.secrets["snowflake"]["database"],
+        schema           = st.secrets["snowflake"]["schema"],
+        role             = st.secrets["snowflake"].get("role", ""),
+        client_session_keep_alive = True,
+        network_timeout  = 30,
+        login_timeout    = 30,
     )
-    src = parser.add_mutually_exclusive_group()
-    src.add_argument("--auto",       action="store_true", help="Auto-download latest ZIP from CMS")
-    src.add_argument("--zip",        metavar="PATH",      help="Path to a downloaded ZIP file")
-    src.add_argument("--url",        metavar="URL",       help="Direct URL to ZIP file")
-    parser.add_argument("--upload",      action="store_true", help="Upload processed data to Snowflake")
-    parser.add_argument("--no-process",  action="store_true", help="Skip processing; load existing output for upload")
-    parser.add_argument("--setup",       action="store_true", help="Run interactive setup to save Snowflake credentials")
-    parser.add_argument("--ma-dir",      metavar="PATH",      help="Path to MA_Contract_directory_2026_04.xlsx to upload")
-    parser.add_argument("--cut-points",  metavar="ZIP_PATH",  help="Path to ZIP to extract and upload Part C and D Cut Points tables")
-    parser.add_argument("--cap",          metavar="HTML_PATH", help="Path to Ad-Hoc CAP Summary Report HTML file to upload")
-    parser.add_argument("--extra-tables", metavar="ZIP_PATH",  help="Upload CAI, Domain Stars, Summary Ratings, High/Low Performing from ZIP")
-    parser.add_argument("--measures",     metavar="ZIP_PATH",  help="Upload 2027 Star Ratings Part C and Part D measure tables from ZIP")
-    parser.add_argument("--cap-info",     metavar="XLSX_PATH", help="Upload CAP letter contact info from Excel to CAP_INFO table")
-    args = parser.parse_args()
 
-    if args.setup:
-        run_setup()
-        sys.exit(0)
-
-    if not args.auto and not args.zip and not args.url and not args.no_process and not args.ma_dir and not args.cut_points and not args.cap and not args.extra_tables and not args.measures and not args.cap_info:
-        parser.print_help()
-        sys.exit(1)
-
-    tmp_dir  = None
-    results  = None
-    crosswks = None
-
+def get_cursor():
+    """Get a cursor, automatically reconnecting if session expired."""
     try:
-        # Only run ZIP processing if a ZIP source was provided
-        if args.auto or args.zip or args.url or args.no_process:
-            if args.no_process:
-                if not args.upload:
-                    print("ERROR: --no-process requires --upload"); sys.exit(1)
-                print("\n[LOAD] Reading existing output files…")
-                results, crosswks = load_existing_outputs()
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")  # test connection
+        return cur
+    except Exception as e:
+        if "390114" in str(e) or "expired" in str(e).lower() or "authentication" in str(e).lower():
+            get_connection.clear()  # clear cached connection
+            conn = get_connection()
+            return conn.cursor()
+        raise e
+
+@st.cache_data(ttl=3600)
+def run_query(sql):
+    cur = get_cursor()
+    cur.execute(sql)
+    cols = [c[0] for c in cur.description]
+    rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
+
+@st.cache_data(ttl=86400)
+def load_measure_weights():
+    """Load 2027 measure weights from Snowflake tables."""
+    try:
+        c_df = run_query(f"""
+            SELECT DISTINCT MEASURE_NAME,
+                   TRY_TO_NUMBER(PART_C_SUMMARY_AND_MA_PD_OVERALL_WEIGHT) AS WEIGHT
+            FROM MA_ANALYTICS.DATA_PROCESSING.STAR_RATINGS_2027_PART_C_MEASURES
+        """)
+        d_df = run_query(f"""
+            SELECT DISTINCT MEASURE_NAME,
+                   TRY_TO_NUMBER(PART_D_SUMMARY_AND_MA_PD_OVERALL_WEIGHT) AS WEIGHT
+            FROM MA_ANALYTICS.DATA_PROCESSING.STAR_RATINGS_2027_PART_D_MEASURES
+        """)
+        weights = {}
+        for _, row in c_df.iterrows():
+            weights[str(row["MEASURE_NAME"])] = row["WEIGHT"]
+        for _, row in d_df.iterrows():
+            weights[str(row["MEASURE_NAME"])] = row["WEIGHT"]
+        return weights
+    except Exception:
+        return {}
+
+DB = "MA_ANALYTICS.DATA_PROCESSING"
+
+# ── BASE CTE ──────────────────────────────────────────────────────────────────
+BASE_CTE = (
+    "WITH CAP_CONTACTS AS ("
+    "SELECT DISTINCT TRIM(CONTRACT_ID) AS CONTRACT_ID, "
+    "RECIPIENT_NAME, EMAIL, DATE_OF_LETTER, SUMMARY AS CAP_LETTER_SUMMARY "
+    "FROM MA_ANALYTICS.DATA_PROCESSING.CAP_INFO"
+    "), "
+    "BASE AS ("
+    "SELECT V.*, C.RECIPIENT_NAME AS CAP_RECIPIENT_NAME, C.EMAIL AS CAP_EMAIL, "
+    "C.DATE_OF_LETTER AS CAP_LETTER_DATE, C.CAP_LETTER_SUMMARY AS CAP_LETTER_DETAILS "
+    "FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V "
+    "LEFT JOIN CAP_CONTACTS C ON TRIM(V.CONTRACT_ID) = TRIM(C.CONTRACT_ID)"
+    ")"
+)
+
+# ── GLOBAL SIDEBAR FILTERS ────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("🔽 Global Filters")
+    st.caption("Applied across all tabs")
+
+    f_state = st.multiselect("State", [
+        "AL","AK","AZ","AR","CA","CO","CT","DC","DE","FL","GA","HI","ID","IL","IN",
+        "IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH",
+        "NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT",
+        "VT","VA","WA","WV","WI","WY","PR","VI","GU"
+    ])
+
+    f_plan_type = st.multiselect("Plan Type", [
+        "HMO","PPO","PFFS","SNP","Cost","MSA","PACE","Demo",
+        "Local PPO","Regional PPO","HMO-POS"
+    ])
+
+    f_plan_name = st.text_input("Plan Name Contains", placeholder="e.g. Humana, United")
+    f_contract_id = st.text_input("Contract ID", placeholder="e.g. H0001")
+
+    enr_col1, enr_col2 = st.columns(2)
+    with enr_col1:
+        f_enr_min = st.number_input("Min Enrollment", min_value=0, value=0, step=1000)
+    with enr_col2:
+        f_enr_max = st.number_input("Max Enrollment", min_value=0, value=50000, step=10000,
+                                     help="Default 50,000 — focuses on small/regional plans without in-house analytics teams")
+
+    f_stars_max = st.selectbox("Max Overall Stars", ["Any","< 2.0","< 2.5","< 3.0","< 3.5","< 4.0"])
+    f_cap_only  = st.checkbox("CAP issues only")
+    f_lpi_only  = st.checkbox("Low performers only")
+
+    st.divider()
+    st.caption("Filters apply when you click Load/Search buttons")
+
+
+def build_filter_clause(prefix=""):
+    """Build WHERE clause additions from sidebar filters."""
+    clauses = []
+    p = prefix + "." if prefix else ""
+
+    if f_state:
+        states = ",".join([f"'{s}'" for s in f_state])
+        clauses.append(f"{p}STATE IN ({states})")
+    if f_plan_type:
+        types = ",".join([f"'{t}'" for t in f_plan_type])
+        clauses.append(f"{p}PLAN_TYPE IN ({types})")
+    if f_plan_name:
+        clauses.append(f"UPPER({p}ORGANIZATION_MARKETING_NAME) LIKE UPPER('%{f_plan_name}%')")
+    if f_contract_id:
+        clauses.append(f"UPPER({p}CONTRACT_ID) = UPPER('{f_contract_id}')")
+    if f_enr_min > 0:
+        clauses.append(f"TRY_TO_NUMBER({p}MBR_CNT) >= {f_enr_min}")
+    if f_enr_max > 0:
+        clauses.append(f"TRY_TO_NUMBER({p}MBR_CNT) <= {f_enr_max}")
+    if f_stars_max != "Any":
+        val = float(f_stars_max.replace("< ", ""))
+        clauses.append(f"TRY_TO_DECIMAL({p}OVERALL_STARS) < {val}")
+    if f_cap_only:
+        clauses.append(f"{p}CAP_ISSUE_TYPE IS NOT NULL")
+    if f_lpi_only:
+        clauses.append(f"{p}REASON_FOR_LPI IS NOT NULL")
+
+    return ("AND " + " AND ".join(clauses)) if clauses else ""
+
+
+# ── TABS ──────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "🎯 Opportunities",
+    "📋 CAP Enforcement",
+    "⚠️ Low Performers",
+    "📊 Star Ratings",
+    "💊 Measures",
+    "📈 Detail Performance",
+    "🏢 Contract Directory",
+    "🤖 AI Chatbot",
+])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — OPPORTUNITIES
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    st.markdown('<div class="section-header">Consulting Opportunity Scorecard</div>', unsafe_allow_html=True)
+    st.caption("CAP issue (+30) · Low performer (+25) · Stars <3.0 (+20) · Stars 3.0–3.4 (+10) · CAI flag (+15)")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        min_score = st.slider("Min opportunity score", 0, 100, 25, 5)
+    with col2:
+        limit = st.selectbox("Show top N", [10, 25, 50, 100, 999], index=1)
+
+    if st.button("🔍 Find Opportunities", type="primary", key="opp_btn"):
+        with st.spinner("Scoring all plans..."):
+            try:
+                fc = build_filter_clause()
+                df = run_query(f"""
+                    {BASE_CTE}
+                    SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                           PARENT_ORGANIZATION, STATE, PLAN_TYPE,
+                           MBR_CNT AS ENROLLMENT, LEGAL_ENTITY_NAME,
+                           CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                           OVERALL_STARS, PART_C_STARS, PART_D_STARS,
+                           CASE WHEN REASON_FOR_LPI  IS NOT NULL THEN '✓' ELSE '' END AS LOW_PERFORMER,
+                           CASE WHEN CAP_ISSUE_TYPE  IS NOT NULL THEN '✓' ELSE '' END AS HAS_CAP,
+                           CAP_ISSUE_TYPE,
+                           CASE WHEN OVERALL_FAC     IS NOT NULL THEN '✓' ELSE '' END AS CAI_FLAG,
+                           OPPORTUNITY_SCORE,
+                           CASE
+                               WHEN UPPER(PARENT_ORGANIZATION) LIKE '%HUMANA%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%UNITED%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%AETNA%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%CVS%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%CENTENE%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%MOLINA%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%ANTHEM%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%ELEVANCE%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%BCBS%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%BLUE CROSS%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%BLUE SHIELD%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%HEALTH CARE SERVICE%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%KAISER%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%CIGNA%'
+                                 OR UPPER(PARENT_ORGANIZATION) LIKE '%WELLCARE%'
+                               THEN '❌ Large National - Skip'
+                               WHEN MBR_CNT > 150000 THEN '⚠️ Large - Likely Has Team'
+                               WHEN MBR_CNT > 50000  THEN '🟡 Mid-Size - Maybe'
+                               ELSE '✅ Small/Regional - Target'
+                           END AS ANALYTICS_TEAM_ASSESSMENT
+                    FROM BASE
+                    WHERE (CASE WHEN CAP_ISSUE_TYPE IS NOT NULL THEN 30 ELSE 0 END
+                         + CASE WHEN REASON_FOR_LPI IS NOT NULL THEN 25 ELSE 0 END
+                         + CASE WHEN TRY_TO_DECIMAL(OVERALL_STARS) < 3.0 THEN 20
+                                WHEN TRY_TO_DECIMAL(OVERALL_STARS) < 3.5 THEN 10 ELSE 0 END
+                         + CASE WHEN OVERALL_FAC    IS NOT NULL THEN 15 ELSE 0 END) >= {min_score}
+                    {fc}
+                    ORDER BY OPPORTUNITY_SCORE DESC LIMIT {limit}
+                """)
+                c1,c2,c3,c4,c5 = st.columns(5)
+                c1.metric("Plans Found", len(df))
+                c2.metric("With CAP", int((df["HAS_CAP"]=="✓").sum()))
+                c3.metric("Low Performers", int((df["LOW_PERFORMER"]=="✓").sum()))
+                try:
+                    c4.metric("Avg Stars", f"{pd.to_numeric(df['OVERALL_STARS'],errors='coerce').mean():.2f}")
+                    c5.metric("Total Enrollment", f"{pd.to_numeric(df['ENROLLMENT'],errors='coerce').sum():,.0f}")
+                except: pass
+                st.dataframe(df, use_container_width=True, height=420)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — CAP ENFORCEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.markdown('<div class="section-header">CAP Enforcement Actions</div>', unsafe_allow_html=True)
+    cap_view = st.radio("View", ["All CAP Issues","By Parent Organization","By Issue Type","CAP + Stars"], horizontal=True)
+    if st.button("📋 Load", key="cap_btn", type="primary"):
+        with st.spinner("Loading..."):
+            try:
+                fc = build_filter_clause()
+                if cap_view == "All CAP Issues":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               PARENT_ORGANIZATION, STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                               CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                               CAP_CONTACT_NAME, CAP_CONTACT_PHONE,
+                               OVERALL_STARS, CAP_ISSUE_TYPE, CAP_ISSUE_SUMMARY
+                        FROM BASE WHERE CAP_ISSUE_TYPE IS NOT NULL {fc}
+                        ORDER BY OVERALL_STARS ASC"""
+                elif cap_view == "By Parent Organization":
+                    q = f"""{BASE_CTE} SELECT DISTINCT PARENT_ORGANIZATION,
+                               COUNT(DISTINCT CONTRACT_ID) AS CONTRACTS,
+                               COUNT(CAP_ISSUE_TYPE) AS CAP_ISSUES,
+                               SUM(MBR_CNT) AS TOTAL_ENROLLMENT,
+                               MIN(TRY_TO_DECIMAL(OVERALL_STARS)) AS LOWEST_STARS
+                        FROM BASE WHERE CAP_ISSUE_TYPE IS NOT NULL {fc}
+                        GROUP BY PARENT_ORGANIZATION ORDER BY CAP_ISSUES DESC"""
+                elif cap_view == "By Issue Type":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CAP_ISSUE_TYPE,
+                               COUNT(*) AS TOTAL, COUNT(DISTINCT CONTRACT_ID) AS CONTRACTS_AFFECTED,
+                               SUM(MBR_CNT) AS MEMBERS_AFFECTED
+                        FROM BASE WHERE CAP_ISSUE_TYPE IS NOT NULL {fc}
+                        GROUP BY CAP_ISSUE_TYPE ORDER BY TOTAL DESC"""
+                else:
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                               CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                               OVERALL_STARS, PART_C_STARS, PART_D_STARS,
+                               CAP_ISSUE_TYPE, CAP_ISSUE_SUMMARY, REASON_FOR_LPI
+                        FROM BASE WHERE CAP_ISSUE_TYPE IS NOT NULL {fc}
+                        ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC"""
+                df = run_query(q)
+                st.success(f"{len(df)} results")
+                st.dataframe(df, use_container_width=True, height=450)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — LOW PERFORMERS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.markdown('<div class="section-header">CMS Low Performer Plans</div>', unsafe_allow_html=True)
+    if st.button("⚠️ Load Low Performers", type="primary", key="lpi_btn"):
+        with st.spinner("Loading..."):
+            try:
+                fc = build_filter_clause()
+                df = run_query(f"""{BASE_CTE}
+                    SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                           PARENT_ORGANIZATION, STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                           CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                           OVERALL_STARS, PART_C_STARS, PART_D_STARS, REASON_FOR_LPI,
+                           CASE WHEN CAP_ISSUE_TYPE IS NOT NULL THEN 'YES' ELSE 'NO' END AS HAS_CAP,
+                           CAP_ISSUE_TYPE, CAP_CONTACT_NAME, CAP_CONTACT_PHONE,
+                           CASE WHEN OVERALL_FAC IS NOT NULL THEN 'YES' ELSE 'NO' END AS HAS_CAI_FLAG
+                    FROM BASE WHERE REASON_FOR_LPI IS NOT NULL {fc}
+                    ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC""")
+                st.metric("Low Performer Plans", len(df))
+                st.dataframe(df, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — STAR RATINGS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown('<div class="section-header">2026 Star Ratings</div>', unsafe_allow_html=True)
+    star_view = st.radio("View", ["All Plans","Below 3.0","Below 3.5","4.0+ Stars","Part C vs D Gap","Domain Stars","High Performers"], horizontal=True)
+    if st.button("📊 Load", key="star_btn", type="primary"):
+        with st.spinner("Loading..."):
+            try:
+                fc = build_filter_clause()
+                if star_view == "All Plans":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                               OVERALL_STARS, PART_C_STARS, PART_D_STARS,
+                               CASE WHEN REASON_FOR_LPI IS NOT NULL THEN '✓' ELSE '' END AS LOW_PERFORMER,
+                               CASE WHEN CAP_ISSUE_TYPE IS NOT NULL THEN '✓' ELSE '' END AS HAS_CAP
+                        FROM BASE WHERE 1=1 {fc} ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC"""
+                elif star_view == "Below 3.0":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                               OVERALL_STARS, PART_C_STARS, PART_D_STARS, REASON_FOR_LPI, CAP_ISSUE_TYPE
+                        FROM BASE WHERE TRY_TO_DECIMAL(OVERALL_STARS) < 3.0 {fc}
+                        ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC"""
+                elif star_view == "Below 3.5":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                               OVERALL_STARS, PART_C_STARS, PART_D_STARS
+                        FROM BASE WHERE TRY_TO_DECIMAL(OVERALL_STARS) < 3.5 {fc}
+                        ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC"""
+                elif star_view == "4.0+ Stars":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                               OVERALL_STARS, PART_C_STARS, PART_D_STARS
+                        FROM BASE WHERE TRY_TO_DECIMAL(OVERALL_STARS) >= 4.0 {fc}
+                        ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) DESC"""
+                elif star_view == "Part C vs D Gap":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               STATE, PLAN_TYPE, PART_C_STARS, PART_D_STARS, OVERALL_STARS,
+                               ROUND(TRY_TO_DECIMAL(PART_C_STARS)-TRY_TO_DECIMAL(PART_D_STARS),2) AS C_MINUS_D_GAP
+                        FROM BASE WHERE 1=1 {fc}
+                        ORDER BY ABS(TRY_TO_DECIMAL(PART_C_STARS)-TRY_TO_DECIMAL(PART_D_STARS)) DESC NULLS LAST"""
+                elif star_view == "Domain Stars":
+                    q = f"SELECT DISTINCT * FROM {DB}.STAR_RATINGS_DOMAIN_STARS ORDER BY 1"
+                else:
+                    q = f"SELECT DISTINCT * FROM {DB}.STAR_RATINGS_HIGH_PERFORMING_CONTRACTS ORDER BY 1"
+
+                df = run_query(q)
+                if star_view not in ["Domain Stars","High Performers"]:
+                    c1,c2,c3 = st.columns(3)
+                    c1.metric("Plans", len(df))
+                    if "ENROLLMENT" in df.columns:
+                        c2.metric("Total Enrollment", f"{pd.to_numeric(df['ENROLLMENT'],errors='coerce').sum():,.0f}")
+                    if "OVERALL_STARS" in df.columns:
+                        c3.metric("Avg Stars", f"{pd.to_numeric(df['OVERALL_STARS'],errors='coerce').mean():.2f}")
+                st.dataframe(df, use_container_width=True, height=440)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — MEASURES
+# ══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown('<div class="section-header">Measure Performance + 2027 Weights</div>', unsafe_allow_html=True)
+    measure_view = st.radio("View", ["Key Measures Summary","Weak Measures (Stars < 3)","2027 Part C Weights","2027 Part D Weights","Measure Crosswalk","Part C Cut Points","Part D Cut Points"], horizontal=True)
+    contract_filter = st.text_input("Filter by Contract ID (optional)", placeholder="e.g. H0001", key="meas_contract")
+    if st.button("💊 Load", key="meas_btn", type="primary"):
+        with st.spinner("Loading..."):
+            try:
+                fc = build_filter_clause()
+                cc = f"AND CONTRACT_ID = '{contract_filter.strip().upper()}'" if contract_filter else ""
+                if measure_view == "Key Measures Summary":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT, OVERALL_STARS,
+                               C01_DATA AS "C01: Breast Cancer Screening [Data]",
+                               C01_STARS AS "C01: Breast Cancer Screening [Stars]",
+                               C01_WEIGHT AS "C01 Weight",
+                               C02_DATA AS "C02: Colorectal Cancer Screening [Data]",
+                               C02_STARS AS "C02: Colorectal Cancer Screening [Stars]",
+                               C02_WEIGHT AS "C02 Weight",
+                               C03_DATA AS "C03: Annual Flu Vaccine [Data]",
+                               C03_STARS AS "C03: Annual Flu Vaccine [Stars]",
+                               C03_WEIGHT AS "C03 Weight",
+                               C04_DATA AS "C04: Improving Physical Health [Data]",
+                               C04_STARS AS "C04: Improving Physical Health [Stars]",
+                               C04_WEIGHT AS "C04 Weight",
+                               C05_DATA AS "C05: Improving Mental Health [Data]",
+                               C05_STARS AS "C05: Improving Mental Health [Stars]",
+                               C05_WEIGHT AS "C05 Weight",
+                               C12_DATA AS "C12: Blood Sugar Controlled [Data]",
+                               C12_STARS AS "C12: Blood Sugar Controlled [Stars]",
+                               C12_WEIGHT AS "C12 Weight",
+                               C14_DATA AS "C14: Controlling Blood Pressure [Data]",
+                               C14_STARS AS "C14: Controlling Blood Pressure [Stars]",
+                               C14_WEIGHT AS "C14 Weight",
+                               C18_DATA AS "C18: Plan All-Cause Readmissions [Data]",
+                               C18_STARS AS "C18: Plan All-Cause Readmissions [Stars]",
+                               C18_WEIGHT AS "C18 Weight",
+                               D08_DATA AS "D08: Med Adherence Diabetes [Data]",
+                               D08_STARS AS "D08: Med Adherence Diabetes [Stars]",
+                               D08_WEIGHT AS "D08 Weight",
+                               D09_DATA AS "D09: Med Adherence Hypertension [Data]",
+                               D09_STARS AS "D09: Med Adherence Hypertension [Stars]",
+                               D09_WEIGHT AS "D09 Weight",
+                               D10_DATA AS "D10: Med Adherence Cholesterol [Data]",
+                               D10_STARS AS "D10: Med Adherence Cholesterol [Stars]",
+                               D10_WEIGHT AS "D10 Weight"
+                        FROM BASE WHERE 1=1 {fc} {cc}
+                        ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC LIMIT 200"""
+                elif measure_view == "Weak Measures (Stars < 3)":
+                    q = f"""{BASE_CTE} SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                               STATE, PLAN_TYPE, OVERALL_STARS,
+                               CASE WHEN TRY_TO_DECIMAL(C01_STARS)<3 THEN C01_STARS END AS "C01: Breast Cancer Screening",
+                               CASE WHEN TRY_TO_DECIMAL(C02_STARS)<3 THEN C02_STARS END AS "C02: Colorectal Cancer Screening",
+                               CASE WHEN TRY_TO_DECIMAL(C03_STARS)<3 THEN C03_STARS END AS "C03: Annual Flu Vaccine",
+                               CASE WHEN TRY_TO_DECIMAL(C12_STARS)<3 THEN C12_STARS END AS "C12: Blood Sugar Controlled",
+                               CASE WHEN TRY_TO_DECIMAL(C14_STARS)<3 THEN C14_STARS END AS "C14: Controlling Blood Pressure",
+                               CASE WHEN TRY_TO_DECIMAL(C18_STARS)<3 THEN C18_STARS END AS "C18: Plan All-Cause Readmissions",
+                               CASE WHEN TRY_TO_DECIMAL(D08_STARS)<3 THEN D08_STARS END AS "D08: Med Adherence Diabetes",
+                               CASE WHEN TRY_TO_DECIMAL(D09_STARS)<3 THEN D09_STARS END AS "D09: Med Adherence Hypertension",
+                               CASE WHEN TRY_TO_DECIMAL(D10_STARS)<3 THEN D10_STARS END AS "D10: Med Adherence Cholesterol"
+                        FROM BASE WHERE 1=1 {fc} {cc}
+                        ORDER BY TRY_TO_DECIMAL(OVERALL_STARS) ASC LIMIT 200"""
+                elif measure_view == "2027 Part C Weights":
+                    q = f"""SELECT DISTINCT
+                               MEASURE_NAME,
+                               WEIGHTING_CATEGORY,
+                               PART_C_SUMMARY_AND_MA_PD_OVERALL_WEIGHT AS WEIGHT
+                            FROM {DB}.STAR_RATINGS_2027_PART_C_MEASURES
+                            ORDER BY TRY_TO_NUMBER(PART_C_SUMMARY_AND_MA_PD_OVERALL_WEIGHT) DESC"""
+                elif measure_view == "2027 Part D Weights":
+                    q = f"""SELECT DISTINCT
+                               MEASURE_NAME,
+                               WEIGHTING_CATEGORY,
+                               PART_D_SUMMARY_AND_MA_PD_OVERALL_WEIGHT AS WEIGHT
+                            FROM {DB}.STAR_RATINGS_2027_PART_D_MEASURES
+                            ORDER BY TRY_TO_NUMBER(PART_D_SUMMARY_AND_MA_PD_OVERALL_WEIGHT) DESC"""
+                elif measure_view == "Measure Crosswalk":
+                    q = f"SELECT DISTINCT * FROM {DB}.STAR_RATINGS_MEASURE_CROSSWALK ORDER BY COLUMN_INDEX"
+                elif measure_view == "Part C Cut Points":
+                    q = f"SELECT DISTINCT * FROM {DB}.STAR_RATINGS_PART_C_CUT_POINTS"
+                else:
+                    q = f"SELECT DISTINCT * FROM {DB}.STAR_RATINGS_PART_D_CUT_POINTS"
+                df = run_query(q)
+                st.success(f"{len(df)} rows")
+                st.dataframe(df, use_container_width=True, height=450)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — DETAIL PERFORMANCE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.markdown('<div class="section-header">Detail Performance Data</div>', unsafe_allow_html=True)
+    st.caption("Full measure data and stars for every plan — data value, star score, and 2027 weight side by side")
+
+    perf_col1, perf_col2, perf_col3 = st.columns(3)
+    with perf_col1:
+        perf_type = st.radio("Measure set", ["Part C", "Part D", "Both"], horizontal=True)
+    with perf_col2:
+        perf_view = st.radio("Show", ["Data + Stars + Weight", "Stars only", "Data only"], horizontal=True)
+    with perf_col3:
+        perf_sort = st.selectbox("Sort by", ["Overall Stars ↑", "Overall Stars ↓", "Enrollment ↓", "Plan Name"])
+
+    sort_map = {
+        "Overall Stars ↑": "TRY_TO_DECIMAL(OVERALL_STARS) ASC",
+        "Overall Stars ↓": "TRY_TO_DECIMAL(OVERALL_STARS) DESC",
+        "Enrollment ↓": "TRY_TO_NUMBER(MBR_CNT) DESC",
+        "Plan Name": "ORGANIZATION_MARKETING_NAME ASC",
+    }
+
+    if st.button("📈 Load Detail Performance", type="primary", key="perf_btn"):
+        with st.spinner("Loading full measure detail..."):
+            try:
+                fc = build_filter_clause()
+
+                # Build measure columns based on selection
+                c_measures = [("C01","Breast Cancer Screening",1),("C02","Colorectal Cancer Screening",1),("C03","Annual Flu Vaccine",1),("C04","Improving or Maintaining Physical Health",3),("C05","Improving or Maintaining Mental Health",3),("C06","Monitoring Physical Activity",1),("C07","Special Needs Plan (SNP) Care Management",1),("C08","Care for Older Adults - Medication Review",1),("C09","Care for Older Adults - Pain Assessment","NULL"),("C10","Osteoporosis Management in Women Who Had a Fracture",1),("C11","Diabetes Care - Eye Exam",1),("C12","Diabetes Care - Blood Sugar Controlled",3),("C13","Kidney Health Evaluation for Patients with Diabetes",1),("C14","Controlling High Blood Pressure",3),("C15","Reducing the Risk of Falling",1),("C16","Improving Bladder Control",1),("C17","Medication Reconciliation Post-Discharge","NULL"),("C18","Plan All-Cause Readmissions",3),("C19","Statin Therapy for Patients with Cardiovascular Disease",1),("C20","Transitions of Care",1),("C21","Follow-up After ED Visit for Multiple High-Risk Chronic Conditions",1),("C22","Getting Needed Care",2),("C23","Getting Appointments and Care Quickly",2),("C24","Customer Service",2),("C25","Rating of Health Care Quality",2),("C26","Rating of Health Plan",2),("C27","Care Coordination",2),("C28","Complaints About the Health Plan",2),("C29","Members Choosing to Leave the Plan",2),("C30","Health Plan Quality Improvement",5),("C31","Plan Makes Timely Decisions About Appeals",2),("C32","Reviewing Appeals Decisions",2),("C33","Call Center Foreign Language Interpreter and TTY Availability",2)]
+                d_measures = [("D01","Call Center Foreign Language Interpreter and TTY Availability (Part D)",2),("D02","Complaints About the Drug Plan",2),("D03","Members Choosing to Leave the Plan (Part D)",2),("D04","Drug Plan Quality Improvement",5),("D05","Rating of Drug Plan",2),("D06","Getting Needed Prescription Drugs",2),("D07","MPF Price Accuracy",1),("D08","Medication Adherence for Diabetes Medications",3),("D09","Medication Adherence for Hypertension (RAS Antagonists)",3),("D10","Medication Adherence for Cholesterol (Statins)",3),("D11","MTM Program Completion Rate for CMR","NULL"),("D12","Statin Use in Persons with Diabetes (SUPD)",1)]
+
+                measures = []
+                if perf_type in ["Part C", "Both"]: measures += c_measures
+                if perf_type in ["Part D", "Both"]: measures += d_measures
+
+                # Load live weights from Snowflake 2027 measure tables
+                sf_weights = load_measure_weights()
+
+                meas_cols = []
+                for code, name, weight in measures:
+                    # Use live weight from Snowflake if available, else fall back to hardcoded
+                    live_w = sf_weights.get(name)
+                    w_label = live_w if live_w is not None else ("N/A" if str(weight) == "NULL" else weight)
+                    if perf_view in ["Data + Stars + Weight", "Data only"]:
+                        meas_cols.append(f'{code}_DATA AS "{code}: {name} [Data] (W:{w_label})"')
+                    if perf_view in ["Data + Stars + Weight", "Stars only"]:
+                        meas_cols.append(f'{code}_STARS AS "{code}: {name} [Stars]"')
+
+                meas_sql = ", ".join(meas_cols)
+
+                q = f"""{BASE_CTE}
+                    SELECT DISTINCT CONTRACT_ID,
+                           ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                           STATE, PLAN_TYPE,
+                           MBR_CNT AS ENROLLMENT,
+                           OVERALL_STARS, PART_C_STARS, PART_D_STARS,
+                           {meas_sql}
+                    FROM BASE
+                    WHERE 1=1 {fc}
+                    ORDER BY {sort_map[perf_sort]}
+                    LIMIT 500"""
+
+                df = run_query(q)
+                c1,c2,c3 = st.columns(3)
+                c1.metric("Plans", len(df))
+                c2.metric("Measures Shown", len(measures))
+                c3.metric("Total Enrollment", f"{pd.to_numeric(df['ENROLLMENT'],errors='coerce').sum():,.0f}")
+
+                st.dataframe(df, use_container_width=True, height=500)
+
+                # Download button
+                csv = df.to_csv(index=False)
+                st.download_button("⬇️ Download as CSV", csv, "detail_performance.csv", "text/csv")
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — CONTRACT DIRECTORY
+# ══════════════════════════════════════════════════════════════════════════════
+with tab7:
+    st.markdown('<div class="section-header">MA Contract Directory 2026</div>', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        dir_search = st.text_input("Search plan name or contract number", placeholder="e.g. Humana or H0001")
+    with col2:
+        dir_state = st.text_input("State (optional)", placeholder="e.g. CA")
+    if st.button("🔍 Search", type="primary", key="dir_btn"):
+        with st.spinner("Searching..."):
+            try:
+                where = []
+                if dir_search:
+                    where.append(f"(UPPER(ORGANIZATION_MARKETING_NAME) LIKE UPPER('%{dir_search}%') OR UPPER(CONTRACT_NUMBER) LIKE UPPER('%{dir_search}%'))")
+                if dir_state:
+                    where.append(f"UPPER(LEGAL_ENTITY_STATE_CODE) = UPPER('{dir_state}')")
+                where_str = "WHERE " + " AND ".join(where) if where else ""
+                df = run_query(f"SELECT DISTINCT * FROM {DB}.MA_CONTRACT_DIRECTORY_2026_04 {where_str} LIMIT 300")
+                st.success(f"{len(df)} contracts found")
+                st.dataframe(df, use_container_width=True, height=450)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 8 — AI CHATBOT
+# ══════════════════════════════════════════════════════════════════════════════
+with tab8:
+    st.markdown('<div class="section-header">MA Consulting AI Chatbot</div>', unsafe_allow_html=True)
+    st.caption("Ask in plain English — the AI queries your live Snowflake data and gives you exact results")
+
+    # Schema context for SQL generation
+    SCHEMA_CONTEXT = """
+    Snowflake CTE BASE columns: CONTRACT_ID, ORGANIZATION_MARKETING_NAME, PARENT_ORGANIZATION,
+    MBR_CNT (enrollment), STATE, PLAN_TYPE, CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+    OVERALL_STARS, PART_C_STARS, PART_D_STARS, REASON_FOR_LPI (NULL=not low performer),
+    OVERALL_FAC (NULL=no CAI flag), CAP_ISSUE_TYPE (NULL=no CAP), CAP_ISSUE_SUMMARY,
+    CAP_CONTACT_NAME, CAP_CONTACT_PHONE, OPPORTUNITY_SCORE (pre-computed).
+    Key measures: C12=Blood Sugar(3), C14=Blood Pressure(3), C18=Readmissions(3), C30=Quality Improvement(5),
+    D08=Med Adherence Diabetes(3), D09=Hypertension(3), D10=Cholesterol(3), D04=Drug Quality(5).
+
+    CRITICAL - CONSULTING FIT LOGIC (always apply when generating SQL):
+    EXCLUDE from results any plan where PARENT_ORGANIZATION ILIKE any of:
+    '%Humana%','%United%','%UnitedHealth%','%Aetna%','%CVS%','%Centene%','%Molina%',
+    '%Anthem%','%BCBS%','%Blue Cross%','%Blue Shield%','%Kaiser%','%Cigna%',
+    '%WellCare%','%Elevance%','%CareSource%','%Oscar%','%Bright Health%'
+    These companies have large in-house analytics teams and are NOT consulting targets.
+
+    IDEAL TARGET PROFILE:
+    - Independent or regional parent organization
+    - MBR_CNT < 50000 (small enough to need outside help)
+    - OVERALL_STARS < 3.5 OR CAP_ISSUE_TYPE IS NOT NULL OR REASON_FOR_LPI IS NOT NULL
+    Always add these filters to SQL unless user explicitly asks for large plans.
+    """
+
+    BASE_CTE_FOR_CHAT = (
+        "WITH CAP_CONTACTS AS ("
+        "SELECT DISTINCT TRIM(CONTRACT_ID) AS CONTRACT_ID, "
+        "RECIPIENT_NAME, EMAIL, DATE_OF_LETTER, SUMMARY AS CAP_LETTER_SUMMARY "
+        "FROM MA_ANALYTICS.DATA_PROCESSING.CAP_INFO "
+        "), "
+        "BASE AS ("
+        "SELECT V.*, C.RECIPIENT_NAME AS CAP_RECIPIENT_NAME, C.EMAIL AS CAP_EMAIL, "
+        "C.DATE_OF_LETTER AS CAP_LETTER_DATE "
+        "FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V "
+        "LEFT JOIN CAP_CONTACTS C ON TRIM(V.CONTRACT_ID) = TRIM(C.CONTRACT_ID)"
+        ")"
+    )
+
+    SQL_GEN_PROMPT = f"""You are a Snowflake SQL expert generating queries for Sadaf's MA consulting firm.
+She targets ONLY small independent plans without in-house analytics teams.
+
+{SCHEMA_CONTEXT}
+
+ALWAYS use this CTE: {BASE_CTE_FOR_CHAT}
+
+ALWAYS include these columns:
+CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME, PARENT_ORGANIZATION,
+STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+OVERALL_STARS, PART_C_STARS, PART_D_STARS, OPPORTUNITY_SCORE,
+CASE WHEN UPPER(PARENT_ORGANIZATION) LIKE '%HUMANA%' OR UPPER(PARENT_ORGANIZATION) LIKE '%UNITED%'
+          OR UPPER(PARENT_ORGANIZATION) LIKE '%AETNA%' OR UPPER(PARENT_ORGANIZATION) LIKE '%CVS%'
+          OR UPPER(PARENT_ORGANIZATION) LIKE '%CENTENE%' OR UPPER(PARENT_ORGANIZATION) LIKE '%ANTHEM%'
+          OR UPPER(PARENT_ORGANIZATION) LIKE '%ELEVANCE%' OR UPPER(PARENT_ORGANIZATION) LIKE '%BCBS%'
+          OR UPPER(PARENT_ORGANIZATION) LIKE '%BLUE CROSS%' OR UPPER(PARENT_ORGANIZATION) LIKE '%KAISER%'
+     THEN 'Large National - Skip'
+     WHEN MBR_CNT > 150000 THEN 'Large - Likely Has Team'
+     WHEN MBR_CNT > 50000  THEN 'Mid-Size - Maybe'
+     ELSE 'Small/Regional - TARGET'
+END AS CONSULTING_FIT
+
+UNLESS user explicitly asks for large plans, ALWAYS add:
+AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE SHIELD%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HEALTH CARE SERVICE%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
+                    AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
+AND MBR_CNT < 150000
+
+For opportunities: ORDER BY OPPORTUNITY_SCORE DESC LIMIT 20
+For CAP: AND CAP_ISSUE_TYPE IS NOT NULL
+For low performers: AND REASON_FOR_LPI IS NOT NULL
+Always LIMIT 50 max. Return ONLY SQL — no explanation, no markdown, no backticks.
+
+Question: """
+
+    # Quick questions
+    st.write("**Quick questions:**")
+    quick_qs = [
+        "Top 10 small independent plans to target for consulting",
+        "Small plans with CAP issues — show contact details",
+        "Low performer plans that are small and independent",
+        "Plans below 3 stars with under 50,000 members",
+        "Small plans with worst medication adherence scores",
+        "Independent plans in California with low stars",
+        "Small plans with both CAP issues and low stars",
+        "Regional plans with CAI flags — no large parent org",
+        "Which small plans have the highest opportunity score?",
+    ]
+    cols = st.columns(3)
+    for i, q in enumerate(quick_qs):
+        if cols[i % 3].button(q, use_container_width=True, key=f"cq{i}"):
+            st.session_state.setdefault("chat_messages", [])
+            last_msg = st.session_state.chat_messages[-1]["content"] if st.session_state.chat_messages else None
+            if not isinstance(last_msg, str) or last_msg != q:
+                st.session_state.chat_messages.append({"role": "user", "content": q})
+                st.session_state.chat_run = True
+
+    st.divider()
+
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    # Display history
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            if isinstance(msg["content"], pd.DataFrame):
+                st.dataframe(msg["content"], use_container_width=True)
             else:
-                zip_path = None
-                if args.auto:
-                    tmp_dir  = Path(tempfile.mkdtemp(prefix="cms_stars_"))
-                    zip_path = auto_download(tmp_dir)
-                elif args.zip:
-                    zip_path = Path(args.zip)
-                    if not zip_path.exists():
-                        print(f"ERROR: File not found: {zip_path}"); sys.exit(1)
-                elif args.url:
-                    tmp_dir  = Path(tempfile.mkdtemp(prefix="cms_stars_"))
-                    session  = requests.Session()
-                    session.headers.update(BROWSER_HEADERS)
-                    session.headers["Referer"] = CMS_PAGE_URL
-                    print(f"\n[DOWNLOAD] {args.url}")
-                    zip_path = _stream_download(session, args.url, tmp_dir)
+                st.markdown(msg["content"])
 
-                results, crosswks = process_zip(zip_path)
+    # Chat input
+    if user_prompt := st.chat_input("Ask about your MA plans — get real data back..."):
+        st.session_state.chat_messages.append({"role": "user", "content": user_prompt})
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+        st.session_state.chat_run = True
 
-            # Upload Star Ratings to Snowflake
-            if args.upload:
-                snowflake_upload(results, crosswks)
+    # Pre-built SQL for quick questions (fast, no AI SQL generation)
+    QUICK_SQL = {
+        "Top 10 small independent plans to target for consulting": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, PLAN_TYPE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, PART_C_STARS, PART_D_STARS,
+                   OPPORTUNITY_SCORE,
+                   CASE WHEN MBR_CNT < 50000 THEN 'Small - TARGET'
+                        WHEN MBR_CNT < 150000 THEN 'Mid-Size - Maybe'
+                        ELSE 'Large - Skip' END AS CONSULTING_FIT
+            FROM BASE
+            WHERE MBR_CNT < 150000
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITEDHEALTHCARE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE SHIELD%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HEALTH CARE SERVICE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HCSC%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%DEVOTED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%OSCAR%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BRIGHT HEALTH%'
+            ORDER BY OPPORTUNITY_SCORE DESC LIMIT 20""",
 
-    finally:
-        if tmp_dir and tmp_dir.exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        "Small plans with CAP issues — show contact details": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, CAP_ISSUE_TYPE, CAP_ISSUE_SUMMARY,
+                   CAP_CONTACT_NAME, CAP_CONTACT_PHONE
+            FROM BASE
+            WHERE CAP_ISSUE_TYPE IS NOT NULL
+            AND MBR_CNT < 150000
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            ORDER BY OVERALL_STARS ASC LIMIT 30""",
 
-    # Handle MA Contract Directory upload
-    if args.ma_dir:
-        ma_path = Path(args.ma_dir)
-        # If path is a folder, find the xlsx inside it
-        if ma_path.is_dir():
-            xlsx_files = list(ma_path.glob("*.xlsx"))
-            if not xlsx_files:
-                print(f"ERROR: No .xlsx file found in folder: {ma_path}")
-                sys.exit(1)
-            ma_path = xlsx_files[0]
-            print(f"  Found file: {ma_path.name}")
-        elif not ma_path.exists():
-            print(f"ERROR: File not found: {ma_path}")
-            sys.exit(1)
-        _validate_sf_config(SNOWFLAKE_CONFIG)
-        import snowflake.connector
-        cfg = SNOWFLAKE_CONFIG
-        db = cfg["database"].upper()
-        schema = cfg["schema"].upper()
-        conn_kwargs = {
-            "account": cfg["account"], "user": cfg["user"],
-            "password": cfg["password"], "warehouse": cfg["warehouse"],
-            "database": db, "schema": schema,
-        }
-        if cfg.get("role"): conn_kwargs["role"] = cfg["role"]
-        print("\n  Connecting to Snowflake for MA Directory upload...")
-        con = snowflake.connector.connect(**conn_kwargs)
-        try:
-            cur = con.cursor()
-            cur.execute(f'USE WAREHOUSE "{cfg["warehouse"]}"')
-            cur.close()
-            process_ma_directory(ma_path, con, db, schema)
-        finally:
-            con.close()
+        "Low performer plans that are small and independent": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, REASON_FOR_LPI, CAP_ISSUE_TYPE
+            FROM BASE
+            WHERE REASON_FOR_LPI IS NOT NULL
+            ORDER BY MBR_CNT ASC LIMIT 20""",
 
-    # Handle Cut Points upload
-    if args.cut_points:
-        cp_path = Path(args.cut_points)
-        if not cp_path.exists():
-            print(f"ERROR: File not found: {cp_path}")
-            sys.exit(1)
-        _validate_sf_config(SNOWFLAKE_CONFIG)
-        import snowflake.connector
-        cfg = SNOWFLAKE_CONFIG
-        db = cfg["database"].upper()
-        schema = cfg["schema"].upper()
-        conn_kwargs = {
-            "account": cfg["account"], "user": cfg["user"],
-            "password": cfg["password"], "warehouse": cfg["warehouse"],
-            "database": db, "schema": schema,
-        }
-        if cfg.get("role"): conn_kwargs["role"] = cfg["role"]
-        print("\n  Connecting to Snowflake for Cut Points upload...")
-        con = snowflake.connector.connect(**conn_kwargs)
-        try:
-            cur = con.cursor()
-            cur.execute(f'USE WAREHOUSE "{cfg["warehouse"]}"')
-            cur.close()
-            process_cut_points(cp_path, con, db, schema)
-        finally:
-            con.close()
+        "Plans below 3 stars with under 50,000 members": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, PART_C_STARS, PART_D_STARS, OPPORTUNITY_SCORE
+            FROM BASE
+            WHERE TRY_TO_DECIMAL(OVERALL_STARS) < 3.0
+            AND MBR_CNT < 50000
+            ORDER BY OVERALL_STARS ASC LIMIT 30""",
 
-    # Handle CAP Summary upload
-    if args.cap:
-        cap_path = Path(args.cap)
-        if not cap_path.exists():
-            print(f"ERROR: File not found: {cap_path}")
-            sys.exit(1)
-        _validate_sf_config(SNOWFLAKE_CONFIG)
-        import snowflake.connector
-        cfg = SNOWFLAKE_CONFIG
-        db = cfg["database"].upper()
-        schema = cfg["schema"].upper()
-        conn_kwargs = {
-            "account": cfg["account"], "user": cfg["user"],
-            "password": cfg["password"], "warehouse": cfg["warehouse"],
-            "database": db, "schema": schema,
-        }
-        if cfg.get("role"): conn_kwargs["role"] = cfg["role"]
-        print("\n  Connecting to Snowflake for CAP Summary upload...")
-        con = snowflake.connector.connect(**conn_kwargs)
-        try:
-            cur = con.cursor()
-            cur.execute(f'USE WAREHOUSE "{cfg["warehouse"]}"')
-            cur.close()
-            process_cap_summary(cap_path, con, db, schema)
-        finally:
-            con.close()
+        "Small plans with worst medication adherence scores": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS,
+                   D08_STARS AS MED_ADHERENCE_DIABETES,
+                   D09_STARS AS MED_ADHERENCE_HYPERTENSION,
+                   D10_STARS AS MED_ADHERENCE_CHOLESTEROL
+            FROM BASE
+            WHERE MBR_CNT < 150000
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%BLUE SHIELD%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HEALTH CARE SERVICE%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
+            ORDER BY TRY_TO_DECIMAL(D08_STARS) ASC NULLS LAST LIMIT 30""",
 
-    # Handle extra tables upload
-    if args.extra_tables:
-        et_path = Path(args.extra_tables)
-        if not et_path.exists():
-            print(f"ERROR: File not found: {et_path}")
-            sys.exit(1)
-        _validate_sf_config(SNOWFLAKE_CONFIG)
-        import snowflake.connector
-        cfg = SNOWFLAKE_CONFIG
-        db = cfg["database"].upper()
-        schema = cfg["schema"].upper()
-        conn_kwargs = {
-            "account": cfg["account"], "user": cfg["user"],
-            "password": cfg["password"], "warehouse": cfg["warehouse"],
-            "database": db, "schema": schema,
-        }
-        if cfg.get("role"): conn_kwargs["role"] = cfg["role"]
-        print("\n  Connecting to Snowflake for extra tables upload...")
-        con = snowflake.connector.connect(**conn_kwargs)
-        try:
-            cur = con.cursor()
-            cur.execute(f'USE WAREHOUSE "{cfg["warehouse"]}"')
-            cur.close()
-            process_extra_tables(et_path, con, db, schema)
-        finally:
-            con.close()
+        "Independent plans in California with low stars": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, PART_C_STARS, PART_D_STARS, OPPORTUNITY_SCORE
+            FROM BASE
+            WHERE STATE = 'CA'
+            AND TRY_TO_DECIMAL(OVERALL_STARS) < 3.5
+            AND MBR_CNT < 150000
+            ORDER BY OVERALL_STARS ASC LIMIT 30""",
 
-    # Handle 2027 Star Ratings measures upload
-    if args.measures:
-        m_path = Path(args.measures)
-        if not m_path.exists():
-            print(f"ERROR: File not found: {m_path}")
-            sys.exit(1)
-        _validate_sf_config(SNOWFLAKE_CONFIG)
-        import snowflake.connector
-        cfg = SNOWFLAKE_CONFIG
-        db = cfg["database"].upper()
-        schema = cfg["schema"].upper()
-        conn_kwargs = {
-            "account": cfg["account"], "user": cfg["user"],
-            "password": cfg["password"], "warehouse": cfg["warehouse"],
-            "database": db, "schema": schema,
-        }
-        if cfg.get("role"): conn_kwargs["role"] = cfg["role"]
-        print("\n  Connecting to Snowflake for Star Measures upload...")
-        con = snowflake.connector.connect(**conn_kwargs)
-        try:
-            cur = con.cursor()
-            cur.execute(f'USE WAREHOUSE "{cfg["warehouse"]}"')
-            cur.close()
-            process_star_measures(m_path, con, db, schema)
-        finally:
-            con.close()
+        "Small plans with both CAP issues and low stars": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, CAP_ISSUE_TYPE, CAP_ISSUE_SUMMARY, OPPORTUNITY_SCORE
+            FROM BASE
+            WHERE CAP_ISSUE_TYPE IS NOT NULL
+            AND TRY_TO_DECIMAL(OVERALL_STARS) < 3.5
+            AND MBR_CNT < 150000
+            ORDER BY OPPORTUNITY_SCORE DESC LIMIT 30""",
 
-    # Handle CAP Info upload
-    if args.cap_info:
-        ci_path = Path(args.cap_info)
-        if not ci_path.exists():
-            print(f"ERROR: File not found: {ci_path}")
-            sys.exit(1)
-        _validate_sf_config(SNOWFLAKE_CONFIG)
-        import snowflake.connector
-        cfg = SNOWFLAKE_CONFIG
-        db = cfg["database"].upper()
-        schema = cfg["schema"].upper()
-        conn_kwargs = {
-            "account": cfg["account"], "user": cfg["user"],
-            "password": cfg["password"], "warehouse": cfg["warehouse"],
-            "database": db, "schema": schema,
-        }
-        if cfg.get("role"): conn_kwargs["role"] = cfg["role"]
-        print("\n  Connecting to Snowflake for CAP Info upload...")
-        con = snowflake.connector.connect(**conn_kwargs)
-        try:
-            cur = con.cursor()
-            cur.execute(f'USE WAREHOUSE "{cfg["warehouse"]}"')
-            cur.close()
-            process_cap_info(ci_path, con, db, schema)
-        finally:
-            con.close()
+        "Regional plans with CAI flags — no large parent org": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, OVERALL_FAC, PART_C_FAC, OPPORTUNITY_SCORE
+            FROM BASE
+            WHERE OVERALL_FAC IS NOT NULL
+            AND MBR_CNT < 150000
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            ORDER BY OPPORTUNITY_SCORE DESC LIMIT 30""",
 
-    print(f"\n{SEP}")
-    print("  All done!")
-    print(SEP + "\n")
+        "Which small plans have the highest opportunity score?": f"""
+            {{BASE_CTE_FOR_CHAT}}
+            SELECT DISTINCT CONTRACT_ID, ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+                   PARENT_ORGANIZATION, STATE, MBR_CNT AS ENROLLMENT,
+                   CONTACT_FIRST_NAME, CONTACT_LAST_NAME, CONTACT_PHONE, CONTACT_EMAIL,
+                   OVERALL_STARS, OPPORTUNITY_SCORE,
+                   CASE WHEN CAP_ISSUE_TYPE IS NOT NULL THEN 'YES' ELSE 'NO' END AS HAS_CAP,
+                   CASE WHEN REASON_FOR_LPI IS NOT NULL THEN 'YES' ELSE 'NO' END AS LOW_PERFORMER,
+                   CASE WHEN OVERALL_FAC IS NOT NULL THEN 'YES' ELSE 'NO' END AS HAS_CAI
+            FROM BASE
+            WHERE MBR_CNT < 150000
+            ORDER BY OPPORTUNITY_SCORE DESC, MBR_CNT ASC LIMIT 20""",
+    }
 
+    # Process
+    if st.session_state.get("chat_run") and st.session_state.chat_messages:
+        st.session_state.chat_run = False
+        last_q = st.session_state.chat_messages[-1]["content"]
+        if not isinstance(last_q, pd.DataFrame):
 
-if __name__ == "__main__":
-    main()
+            with st.chat_message("assistant"):
+                with st.spinner("Querying your Snowflake data..."):
+                    try:
+                        cur = get_cursor()
+
+                        EXPLAIN_PROMPT = """You are Sadaf's MA consulting analyst. Sadaf targets ONLY small independent plans.
+RULE: Filter out Humana, United, Aetna, CVS, Centene, Molina, Anthem, BCBS, Blue Cross, Blue Shield, Kaiser, Cigna, WellCare, Elevance.
+For your response list only small/independent plans with:
+Contract ID, Plan Name, State, Enrollment, Stars, Contact Name, Phone, Email, why they need help, cold outreach pitch."""
+
+                        # Check if it is a quick question with pre-built SQL
+                        if last_q in QUICK_SQL:
+                            sql = QUICK_SQL[last_q].format(BASE_CTE_FOR_CHAT=BASE_CTE_FOR_CHAT)
+                            cur.execute(sql)
+                            cols = [c[0] for c in cur.description]
+                            rows = cur.fetchall()
+                            result_df = pd.DataFrame(rows, columns=cols)
+
+                            st.success(f"Found {len(result_df)} results from your live Snowflake data")
+                            st.dataframe(result_df, use_container_width=True, height=350)
+                            st.session_state.chat_messages.append({"role": "assistant", "content": result_df})
+
+                            if len(result_df) > 0:
+                                try:
+                                    cur2 = get_cursor()
+                                    data_preview = result_df.head(5).to_string(index=False)
+                                    explain_req = f"{EXPLAIN_PROMPT}\n\nQuestion: {last_q}\n\nTop results:\n{data_preview}"
+                                    explain_esc = explain_req.replace("\\", "\\\\").replace("'", "\\'")
+                                    cur2.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{explain_esc}') AS ANSWER")
+                                    cur2._connection.execute_helper(timeout=15)
+                                    raw = cur2.fetchone()[0]
+                                    try:
+                                        parsed = json.loads(raw)
+                                        answer = parsed["choices"][0]["message"]["content"]
+                                    except Exception:
+                                        answer = raw
+                                    st.markdown("**💡 Key Takeaways:**")
+                                    st.markdown(answer)
+                                    st.session_state.chat_messages.append({"role": "assistant", "content": "**💡 Key Takeaways:**\n" + answer})
+                                except Exception:
+                                    pass  # Skip AI analysis if it times out — data is already shown
+
+                            csv = result_df.to_csv(index=False)
+                            st.download_button("⬇️ Download results", csv, "chat_results.csv", "text/csv", key=f"dl_{len(st.session_state.chat_messages)}")
+
+                        else:
+                            # Custom question — use AI to generate SQL
+                            cur = get_cursor()
+                            sql_prompt = f"{SQL_GEN_PROMPT}{last_q}"
+                            sql_esc = sql_prompt.replace("\\", "\\\\").replace("'", "\\'")
+                            cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{sql_esc}') AS SQL_OUT")
+                            raw_sql = cur.fetchone()[0]
+                            try:
+                                parsed = json.loads(raw_sql)
+                                gen_sql = parsed["choices"][0]["message"]["content"].strip()
+                            except Exception:
+                                gen_sql = raw_sql.strip()
+
+                            gen_sql = gen_sql.replace("```sql","").replace("```","").strip()
+
+                            try:
+                                cur.execute(gen_sql)
+                                cols = [c[0] for c in cur.description]
+                                rows = cur.fetchall()
+                                result_df = pd.DataFrame(rows, columns=cols)
+                                st.success(f"Found {len(result_df)} results")
+                                st.dataframe(result_df, use_container_width=True, height=350)
+                                st.session_state.chat_messages.append({"role": "assistant", "content": result_df})
+
+                                if len(result_df) > 0:
+                                    data_preview = result_df.head(5).to_string(index=False)
+                                    explain_req = f"{EXPLAIN_PROMPT}\n\nQuestion: {last_q}\n\nTop results:\n{data_preview}"
+                                    explain_esc = explain_req.replace("\\", "\\\\").replace("'", "\\'")
+                                    cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{explain_esc}') AS ANSWER")
+                                    raw = cur.fetchone()[0]
+                                    try:
+                                        parsed = json.loads(raw)
+                                        answer = parsed["choices"][0]["message"]["content"]
+                                    except Exception:
+                                        answer = raw
+                                    st.markdown("**💡 Key Takeaways:**")
+                                    st.markdown(answer)
+                                    st.session_state.chat_messages.append({"role": "assistant", "content": "**💡 Key Takeaways:**\n" + answer})
+
+                                csv = result_df.to_csv(index=False)
+                                st.download_button("⬇️ Download results", csv, "chat_results.csv", "text/csv", key=f"dl_{len(st.session_state.chat_messages)}")
+
+                            except Exception as sql_err:
+                                st.warning(f"Could not run SQL. Answering from general knowledge...")
+                                fallback_req = f"You are an MA consulting analyst. Answer briefly (3 bullet points): {last_q}"
+                                fallback_esc = fallback_req.replace("\\", "\\\\").replace("'", "\\'")
+                                cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{fallback_esc}') AS ANSWER")
+                                raw_fb = cur.fetchone()[0]
+                                try:
+                                    parsed_fb = json.loads(raw_fb)
+                                    fb_answer = parsed_fb["choices"][0]["message"]["content"]
+                                except Exception:
+                                    fb_answer = raw_fb
+                                st.markdown(fb_answer)
+                                st.session_state.chat_messages.append({"role": "assistant", "content": fb_answer})
+
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+    if st.session_state.get("chat_messages"):
+        if st.button("🗑️ Clear conversation", key="clear_chat"):
+            st.session_state.chat_messages = []
+            st.rerun()
