@@ -22,19 +22,35 @@ st.markdown("<div style='text-align:right; font-size:11px; color:#999; margin-to
 @st.cache_resource
 def get_connection():
     return snowflake.connector.connect(
-        account   = st.secrets["snowflake"]["account"],
-        user      = st.secrets["snowflake"]["user"],
-        password  = st.secrets["snowflake"]["password"],
-        warehouse = st.secrets["snowflake"]["warehouse"],
-        database  = st.secrets["snowflake"]["database"],
-        schema    = st.secrets["snowflake"]["schema"],
-        role      = st.secrets["snowflake"].get("role", ""),
+        account          = st.secrets["snowflake"]["account"],
+        user             = st.secrets["snowflake"]["user"],
+        password         = st.secrets["snowflake"]["password"],
+        warehouse        = st.secrets["snowflake"]["warehouse"],
+        database         = st.secrets["snowflake"]["database"],
+        schema           = st.secrets["snowflake"]["schema"],
+        role             = st.secrets["snowflake"].get("role", ""),
+        client_session_keep_alive = True,
+        network_timeout  = 30,
+        login_timeout    = 30,
     )
+
+def get_cursor():
+    """Get a cursor, automatically reconnecting if session expired."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")  # test connection
+        return cur
+    except Exception as e:
+        if "390114" in str(e) or "expired" in str(e).lower() or "authentication" in str(e).lower():
+            get_connection.clear()  # clear cached connection
+            conn = get_connection()
+            return conn.cursor()
+        raise e
 
 @st.cache_data(ttl=3600)
 def run_query(sql):
-    conn = get_connection()
-    cur = conn.cursor()
+    cur = get_cursor()
     cur.execute(sql)
     cols = [c[0] for c in cur.description]
     rows = cur.fetchall()
@@ -783,8 +799,7 @@ Question: """
             with st.chat_message("assistant"):
                 with st.spinner("Querying your Snowflake data..."):
                     try:
-                        conn = get_connection()
-                        cur = conn.cursor()
+                        cur = get_cursor()
 
                         # Check if it is a quick question with pre-built SQL
                         if last_q in QUICK_SQL:
@@ -818,6 +833,7 @@ Question: """
 
                         else:
                             # Custom question — use AI to generate SQL
+                            cur = get_cursor()
                             sql_prompt = f"{SQL_GEN_PROMPT}{last_q}"
                             sql_esc = sql_prompt.replace("\\", "\\\\").replace("'", "\\'")
                             cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{sql_esc}') AS SQL_OUT")
