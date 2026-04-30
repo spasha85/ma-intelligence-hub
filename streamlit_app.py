@@ -205,6 +205,7 @@ with tab1:
     FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
     LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
         ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
+    """ + build_where() + """
     ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST, V.MBR_CNT ASC NULLS LAST
     LIMIT 300
     """
@@ -288,7 +289,7 @@ with tab2:
     st.header("📋 CAP Enforcement Actions")
     st.caption("CMS corrective actions — compliance contacts are warm leads for consulting outreach")
 
-    CAP_SQL = f"""
+    CAP_SQL = """
     SELECT
         C."Contract_ID"                             AS CONTRACT_ID,
         C.ORGANIZATION_MARKETING_NAME               AS PLAN_NAME,
@@ -304,9 +305,27 @@ with tab2:
         C.Issue_Summary,
         V."2026_OVERALL"                            AS OVERALL_STARS,
         V.OPPORTUNITY_SCORE,
-        {FIT_CASE}                                  AS CONSULTING_FIT
-    FROM {C} C
-    LEFT JOIN {V} V
+        CASE
+            WHEN UPPER(C.Parent_Organization_Name) LIKE '%HUMANA%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%UNITED%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%AETNA%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%CVS%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%CENTENE%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%MOLINA%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%ANTHEM%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%ELEVANCE%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%BCBS%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%BLUE CROSS%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%KAISER%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%CIGNA%'
+              OR UPPER(C.Parent_Organization_Name) LIKE '%WELLCARE%'
+              THEN 'Large National'
+            WHEN C.MBR_CNT > 150000 THEN 'Large - Has Team'
+            WHEN C.MBR_CNT > 50000  THEN 'Mid-Size - Maybe'
+            ELSE 'Small/Regional - TARGET'
+        END                                         AS CONSULTING_FIT
+    FROM MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
+    LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
         ON TRIM(C."Contract_ID") = TRIM(V.CONTRACT_ID)
     ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST
     LIMIT 500
@@ -378,8 +397,26 @@ with tab3:
         V.REASON_FOR_LPI,
         V.OVERALL_FAC                   AS CAI_FLAG,
         V.OPPORTUNITY_SCORE,
-        {FIT_CASE}                      AS CONSULTING_FIT
-    FROM {V} V
+        CASE
+            WHEN UPPER(V.PARENT_ORGANIZATION) LIKE '%HUMANA%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%UNITED%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%AETNA%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CVS%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CENTENE%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%MOLINA%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%ANTHEM%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%ELEVANCE%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%BCBS%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%BLUE CROSS%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%KAISER%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CIGNA%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%WELLCARE%'
+              THEN 'Large National'
+            WHEN V.MBR_CNT > 150000 THEN 'Large - Has Team'
+            WHEN V.MBR_CNT > 50000  THEN 'Mid-Size - Maybe'
+            ELSE 'Small/Regional - TARGET'
+        END                             AS CONSULTING_FIT
+    FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
     {wh3}
     ORDER BY TRY_TO_DECIMAL(V."2026_OVERALL") ASC NULLS LAST
     LIMIT 500
@@ -432,10 +469,22 @@ with tab4:
                    COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL,
                    COALESCE(C.Issue_Type, V.Issue_Type) AS CAP_ISSUE,
                    V.REASON_FOR_LPI
-            FROM {V} V
-            LEFT JOIN {C} C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
+            FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
+            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
             WHERE V.MBR_CNT < 100000
-            AND {LN_WHERE_V}
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
             ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST LIMIT 10""",
 
         "Plans with CAP issues + low stars": f"""
@@ -447,12 +496,24 @@ with tab4:
                    COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL,
                    COALESCE(C.Issue_Type, V.Issue_Type) AS CAP_ISSUE,
                    C.DATE_OF_LETTER AS CAP_DATE
-            FROM {V} V
-            LEFT JOIN {C} C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
+            FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
+            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
             WHERE V.Issue_Type IS NOT NULL
             AND TRY_TO_DECIMAL(V."2026_OVERALL") < 3.5
             AND V.MBR_CNT < 150000
-            AND {LN_WHERE_V}
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CVS%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
+            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
             ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST LIMIT 20""",
 
         "Small plans below 3 stars": f"""
@@ -464,8 +525,8 @@ with tab4:
                    V.OPPORTUNITY_SCORE,
                    COALESCE(C.RECIPIENT_NAME, V.RECIPIENT_NAME) AS CONTACT_NAME,
                    COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL
-            FROM {V} V
-            LEFT JOIN {C} C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
+            FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
+            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
             WHERE TRY_TO_DECIMAL(V."2026_OVERALL") < 3.0
             AND V.MBR_CNT < 50000
             ORDER BY TRY_TO_DECIMAL(V."2026_OVERALL") ASC NULLS LAST LIMIT 25""",
@@ -477,8 +538,8 @@ with tab4:
                    V.REASON_FOR_LPI, V.OPPORTUNITY_SCORE,
                    COALESCE(C.RECIPIENT_NAME, V.RECIPIENT_NAME) AS CONTACT_NAME,
                    COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL
-            FROM {V} V
-            LEFT JOIN {C} C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
+            FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
+            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
             WHERE V.REASON_FOR_LPI IS NOT NULL
             ORDER BY V.MBR_CNT ASC NULLS LAST LIMIT 25""",
 
@@ -490,10 +551,22 @@ with tab4:
                    C.RECIPIENT_NAME, C.EMAIL, C.DATE_OF_LETTER,
                    C.Issue_Type, C.Issue_Topic,
                    V."2026_OVERALL" AS OVERALL_STARS, V.OPPORTUNITY_SCORE
-            FROM {C} C
-            LEFT JOIN {V} V ON TRIM(C."Contract_ID") = TRIM(V.CONTRACT_ID)
+            FROM MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
+            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V ON TRIM(C."Contract_ID") = TRIM(V.CONTRACT_ID)
             WHERE C.MBR_CNT < 100000
-            AND {LN_WHERE_C}
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%HUMANA%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%UNITED%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%AETNA%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%CVS%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%CENTENE%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%MOLINA%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%ANTHEM%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%ELEVANCE%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%BCBS%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%BLUE CROSS%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%KAISER%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%CIGNA%'
+            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%WELLCARE%'
             AND C.RECIPIENT_NAME IS NOT NULL
             ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST LIMIT 30""",
     }
@@ -572,7 +645,7 @@ with tab4:
                                 f"{AI_CONTEXT}\n\n"
                                 f"Generate Snowflake SQL for: {last_q}\n\n"
                                 f"TABLES (use exact column names):\n"
-                                f"1. {V} AS V\n"
+                                f"1. MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB AS V\n"
                                 f"   Columns: CONTRACT_ID, ORGANIZATION_MARKETING_NAME, PARENT_ORGANIZATION, "
                                 f"MBR_CNT, LEGAL_ENTITY_STATE_CODE, PLAN_TYPE, "
                                 f"RECIPIENT_NAME, RECIPIENT_EMAIL, DATE_OF_LETTER_LATEST, "
@@ -582,7 +655,7 @@ with tab4:
                                 f"REASON_FOR_LPI, OVERALL_FAC, PART_C_FAC, PART_D_MAPD_FAC, "
                                 f"Issue_Type, Issue_Summary, Organization_Contact_Name, "
                                 f"Organization_Contact_Phone, OPPORTUNITY_SCORE\n"
-                                f"2. {C} AS C\n"
+                                f"2. MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY AS C\n"
                                 f"   Columns: \"Contract_ID\" (MIXED CASE - always quote!), "
                                 f"ORGANIZATION_MARKETING_NAME, Parent_Organization_Name, "
                                 f"RECIPIENT_NAME, EMAIL, DATE_OF_LETTER, SUMMARY, FILE_NAME, "
