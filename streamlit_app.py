@@ -177,8 +177,7 @@ with tab1:
         COALESCE(C.EMAIL,
                  V.RECIPIENT_EMAIL,
                  V.DIRECTORY_CONTACT_EMAIL)                                     AS CONTACT_EMAIL,
-        COALESCE(V.Organization_Contact_Phone,
-                 V.DIRECTORY_CONTACT_PHONE)                                     AS CONTACT_PHONE,
+        V.DIRECTORY_CONTACT_PHONE                                               AS CONTACT_PHONE,
         C.DATE_OF_LETTER                                                        AS CAP_LETTER_DATE,
         -- Compliance flags
         COALESCE(C.Issue_Type,  V.Issue_Type)                                  AS CAP_ISSUE_TYPE,
