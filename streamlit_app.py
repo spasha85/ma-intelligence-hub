@@ -72,7 +72,7 @@ LN = [
     "DEVOTED","OSCAR","BRIGHT HEALTH"
 ]
 LN_WHERE_V = " AND ".join([f"UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%{n}%'" for n in LN])
-LN_WHERE_C = " AND ".join([f'UPPER(C.ORGANIZATION_MARKETING_NAME) NOT LIKE \'%{n}%\'' for n in LN])
+LN_WHERE_C = " AND ".join([f'UPPER(C.Parent_Organization_Name) NOT LIKE \'%{n}%\'' for n in LN])
 
 # Consulting fit label
 FIT_CASE = """CASE
