@@ -72,7 +72,7 @@ LN = [
     "DEVOTED","OSCAR","BRIGHT HEALTH"
 ]
 LN_WHERE_V = " AND ".join([f"UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%{n}%'" for n in LN])
-LN_WHERE_C = " AND ".join([f"UPPER(C.Parent_Organization_Name) NOT LIKE '%{n}%'" for n in LN])
+LN_WHERE_C = " AND ".join([f'UPPER(C.ORGANIZATION_MARKETING_NAME) NOT LIKE \'%{n}%\'' for n in LN])
 
 # Consulting fit label
 FIT_CASE = """CASE
@@ -157,7 +157,7 @@ with tab1:
 
     wh = build_where()
 
-    OPP_SQL = f"""
+    OPP_SQL = """
     SELECT
         V.CONTRACT_ID,
         V.ORGANIZATION_MARKETING_NAME                                           AS PLAN_NAME,
@@ -169,7 +169,6 @@ with tab1:
         V."2026_PART_C_SUMMARY"                                                 AS PART_C_STARS,
         V."2026_PART_D_SUMMARY"                                                 AS PART_D_STARS,
         V.OPPORTUNITY_SCORE,
-        -- Contact priority: CAP letter → View RECIPIENT → Directory
         COALESCE(C.RECIPIENT_NAME,
                  V.RECIPIENT_NAME,
                  V.DIRECTORY_CONTACT_FIRST_NAME || ' ' || V.DIRECTORY_CONTACT_LAST_NAME)
@@ -179,18 +178,33 @@ with tab1:
                  V.DIRECTORY_CONTACT_EMAIL)                                     AS CONTACT_EMAIL,
         V.DIRECTORY_CONTACT_PHONE                                               AS CONTACT_PHONE,
         C.DATE_OF_LETTER                                                        AS CAP_LETTER_DATE,
-        -- Compliance flags
-        COALESCE(C.Issue_Type,  V.Issue_Type)                                  AS CAP_ISSUE_TYPE,
-        COALESCE(C.Issue_Topic, '')                                             AS CAP_ISSUE_TOPIC,
-        COALESCE(C.Issue_Summary, V.Issue_Summary)                             AS CAP_ISSUE_SUMMARY,
+        COALESCE(C."Issue_Type",  V."Issue_Type")                               AS CAP_ISSUE_TYPE,
+        COALESCE(C."Issue_Topic", '')                                          AS CAP_ISSUE_TOPIC,
+        COALESCE(C."Issue_Summary", V."Issue_Summary")                          AS CAP_ISSUE_SUMMARY,
         V.REASON_FOR_LPI,
         V.OVERALL_FAC                                                           AS CAI_FLAG,
-        -- Consulting fit
-        {FIT_CASE}                                                              AS CONSULTING_FIT
-    FROM {V} V
-    LEFT JOIN {C} C
+        CASE
+            WHEN UPPER(V.PARENT_ORGANIZATION) LIKE '%HUMANA%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%UNITED%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%AETNA%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CVS%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CENTENE%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%MOLINA%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%ANTHEM%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%ELEVANCE%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%BCBS%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%BLUE CROSS%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%KAISER%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CIGNA%'
+              OR UPPER(V.PARENT_ORGANIZATION) LIKE '%WELLCARE%'
+              THEN 'Large National'
+            WHEN V.MBR_CNT > 150000 THEN 'Large - Has Team'
+            WHEN V.MBR_CNT > 50000  THEN 'Mid-Size - Maybe'
+            ELSE 'Small/Regional - TARGET'
+        END                                                                     AS CONSULTING_FIT
+    FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
+    LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
         ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
-    {wh}
     ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST, V.MBR_CNT ASC NULLS LAST
     LIMIT 300
     """
