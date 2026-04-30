@@ -72,7 +72,7 @@ LN = [
     "DEVOTED","OSCAR","BRIGHT HEALTH"
 ]
 LN_WHERE_V = " AND ".join([f"UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%{n}%'" for n in LN])
-LN_WHERE_C = " AND ".join([f'UPPER(C.Parent_Organization_Name) NOT LIKE \'%{n}%\'' for n in LN])
+LN_WHERE_C = " AND ".join([f'UPPER(C."Parent_Organization_Name") NOT LIKE \'%{n}%\'' for n in LN])
 
 # Consulting fit label
 FIT_CASE = """CASE
@@ -293,32 +293,32 @@ with tab2:
     SELECT
         C."Contract_ID"                             AS CONTRACT_ID,
         C.ORGANIZATION_MARKETING_NAME               AS PLAN_NAME,
-        C.Parent_Organization_Name                  AS PARENT_ORG,
+        C."Parent_Organization_Name"                  AS PARENT_ORG,
         C.LEGAL_ENTITY_STATE_CODE                   AS STATE,
         C.PLAN_TYPE,
         C.MBR_CNT                                   AS ENROLLMENT,
         C.RECIPIENT_NAME,
         C.EMAIL,
         C.DATE_OF_LETTER,
-        C.Issue_Type,
-        C.Issue_Topic,
-        C.Issue_Summary,
+        C."Issue_Type",
+        C."Issue_Topic",
+        C."Issue_Summary",
         V."2026_OVERALL"                            AS OVERALL_STARS,
         V.OPPORTUNITY_SCORE,
         CASE
-            WHEN UPPER(C.Parent_Organization_Name) LIKE '%HUMANA%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%UNITED%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%AETNA%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%CVS%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%CENTENE%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%MOLINA%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%ANTHEM%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%ELEVANCE%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%BCBS%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%BLUE CROSS%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%KAISER%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%CIGNA%'
-              OR UPPER(C.Parent_Organization_Name) LIKE '%WELLCARE%'
+            WHEN UPPER(C."Parent_Organization_Name") LIKE '%HUMANA%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%UNITED%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%AETNA%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%CVS%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%CENTENE%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%MOLINA%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%ANTHEM%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%ELEVANCE%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%BCBS%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%BLUE CROSS%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%KAISER%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%CIGNA%'
+              OR UPPER(C."Parent_Organization_Name") LIKE '%WELLCARE%'
               THEN 'Large National'
             WHEN C.MBR_CNT > 150000 THEN 'Large - Has Team'
             WHEN C.MBR_CNT > 50000  THEN 'Mid-Size - Maybe'
@@ -467,7 +467,7 @@ with tab4:
                             V.DIRECTORY_CONTACT_FIRST_NAME || ' ' || V.DIRECTORY_CONTACT_LAST_NAME)
                             AS CONTACT_NAME,
                    COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL,
-                   COALESCE(C.Issue_Type, V.Issue_Type) AS CAP_ISSUE,
+                   COALESCE(C."Issue_Type", V.Issue_Type) AS CAP_ISSUE,
                    V.REASON_FOR_LPI
             FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
             LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
@@ -494,7 +494,7 @@ with tab4:
                    V.OPPORTUNITY_SCORE,
                    COALESCE(C.RECIPIENT_NAME, V.RECIPIENT_NAME) AS CONTACT_NAME,
                    COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL,
-                   COALESCE(C.Issue_Type, V.Issue_Type) AS CAP_ISSUE,
+                   COALESCE(C."Issue_Type", V.Issue_Type) AS CAP_ISSUE,
                    C.DATE_OF_LETTER AS CAP_DATE
             FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
             LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
@@ -546,27 +546,27 @@ with tab4:
         "CAP contacts — small independent plans": f"""
             SELECT C."Contract_ID" AS CONTRACT_ID,
                    C.ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
-                   C.Parent_Organization_Name AS PARENT_ORG,
+                   C."Parent_Organization_Name" AS PARENT_ORG,
                    C.LEGAL_ENTITY_STATE_CODE AS STATE, C.MBR_CNT AS ENROLLMENT,
                    C.RECIPIENT_NAME, C.EMAIL, C.DATE_OF_LETTER,
-                   C.Issue_Type, C.Issue_Topic,
+                   C."Issue_Type", C."Issue_Topic",
                    V."2026_OVERALL" AS OVERALL_STARS, V.OPPORTUNITY_SCORE
             FROM MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
             LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V ON TRIM(C."Contract_ID") = TRIM(V.CONTRACT_ID)
             WHERE C.MBR_CNT < 100000
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%HUMANA%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%UNITED%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%AETNA%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%CVS%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%CENTENE%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%MOLINA%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%ANTHEM%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%ELEVANCE%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%BCBS%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%BLUE CROSS%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%KAISER%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%CIGNA%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%WELLCARE%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%HUMANA%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%UNITED%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%AETNA%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%CVS%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%CENTENE%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%MOLINA%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%ANTHEM%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%ELEVANCE%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%BCBS%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%BLUE CROSS%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%KAISER%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%CIGNA%'
+            AND UPPER(C."Parent_Organization_Name") NOT LIKE '%WELLCARE%'
             AND C.RECIPIENT_NAME IS NOT NULL
             ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST LIMIT 30""",
     }
