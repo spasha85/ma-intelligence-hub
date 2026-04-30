@@ -5,16 +5,16 @@ import json
 
 st.set_page_config(page_title="MA Intelligence Hub", page_icon="🎯", layout="wide")
 
-# ── CONNECTION ────────────────────────────────────────────────────────────────
+# ─── CONNECTION ───────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_connection():
     return snowflake.connector.connect(
-        account   = st.secrets["snowflake"]["account"],
-        user      = st.secrets["snowflake"]["user"],
-        password  = st.secrets["snowflake"]["password"],
-        warehouse = st.secrets["snowflake"]["warehouse"],
-        database  = st.secrets["snowflake"]["database"],
-        schema    = st.secrets["snowflake"]["schema"],
+        account=st.secrets["snowflake"]["account"],
+        user=st.secrets["snowflake"]["user"],
+        password=st.secrets["snowflake"]["password"],
+        warehouse=st.secrets["snowflake"]["warehouse"],
+        database=st.secrets["snowflake"]["database"],
+        schema=st.secrets["snowflake"]["schema"],
         client_session_keep_alive=True,
     )
 
@@ -37,131 +37,179 @@ def run_query(sql):
     cols = [c[0] for c in cur.description]
     return pd.DataFrame(cur.fetchall(), columns=cols)
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
-LARGE_NATIONALS = [
+# ─── TABLE / COLUMN REFERENCE (from DESCRIBE TABLE output) ───────────────────
+#
+# VW_MA_INTELLIGENCE_HUB  (alias V)
+#   CONTRACT_ID, ORGANIZATION_MARKETING_NAME, PARENT_ORGANIZATION
+#   RECIPIENT_NAME, RECIPIENT_EMAIL, DATE_OF_LETTER_LATEST
+#   MBR_CNT, LEGAL_ENTITY_NAME, LEGAL_ENTITY_STATE_CODE, PLAN_TYPE
+#   DIRECTORY_CONTACT_FIRST_NAME, DIRECTORY_CONTACT_LAST_NAME,
+#   DIRECTORY_CONTACT_PHONE, DIRECTORY_CONTACT_EMAIL
+#   "2026_PART_C_SUMMARY", "2026_PART_D_SUMMARY", "2026_OVERALL"
+#   REASON_FOR_LPI, OVERALL_FAC, PART_C_FAC, PART_D_MAPD_FAC
+#   Issue_Type, Issue_Summary, Organization_Contact_Name, Organization_Contact_Phone
+#   OPPORTUNITY_SCORE
+#   C01..C33 star scores, D01..D12 star scores (+ _DATA variants)
+#
+# CONTRACTS_CAP_SUMMARY  (alias C)
+#   Contract_ID  ← NOTE: mixed case, not CONTRACT_ID
+#   RECIPIENT_NAME, EMAIL, SUMMARY, FILE_NAME, DATE_OF_LETTER
+#   Parent_Organization_Name, Issue_Type, Issue_Topic, Issue_Summary
+#   ORGANIZATION_MARKETING_NAME, ORGANIZATION_TYPE
+#   LEGAL_ENTITY_NAME, LEGAL_ENTITY_CITY, LEGAL_ENTITY_STATE_CODE
+#   PLAN_TYPE, CONTRACT_EFFECTIVE_DATE, TAX_STATUS, MBR_CNT
+#
+# JOIN: TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
+
+V  = "MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB"
+C  = "MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY"
+
+# Large national filter on VIEW table
+LN = [
     "HUMANA","UNITED","UNITEDHEALTHCARE","AETNA","CVS","CENTENE","MOLINA",
     "ANTHEM","ELEVANCE","BCBS","BLUE CROSS","BLUE SHIELD",
-    "HEALTH CARE SERVICE","HCSC","KAISER","CIGNA","WELLCARE","MOLINA",
+    "HEALTH CARE SERVICE","HCSC","KAISER","CIGNA","WELLCARE",
     "DEVOTED","OSCAR","BRIGHT HEALTH"
 ]
+LN_WHERE_V = " AND ".join([f"UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%{n}%'" for n in LN])
+LN_WHERE_C = " AND ".join([f"UPPER(C.Parent_Organization_Name) NOT LIKE '%{n}%'" for n in LN])
 
-LN_FILTER_V = " AND ".join([f"UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%{n}%'" for n in LARGE_NATIONALS])
-LN_FILTER_C = " AND ".join([f"UPPER(C.Parent_Organization_Name) NOT LIKE '%{n}%'" for n in LARGE_NATIONALS])
-
-CONSULTING_FIT_V = """CASE
-    WHEN (UPPER(V.PARENT_ORGANIZATION) LIKE '%HUMANA%' OR UPPER(V.PARENT_ORGANIZATION) LIKE '%UNITED%'
-       OR UPPER(V.PARENT_ORGANIZATION) LIKE '%AETNA%'  OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CVS%'
-       OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CENTENE%' OR UPPER(V.PARENT_ORGANIZATION) LIKE '%MOLINA%'
-       OR UPPER(V.PARENT_ORGANIZATION) LIKE '%ANTHEM%'  OR UPPER(V.PARENT_ORGANIZATION) LIKE '%ELEVANCE%'
-       OR UPPER(V.PARENT_ORGANIZATION) LIKE '%BCBS%'    OR UPPER(V.PARENT_ORGANIZATION) LIKE '%BLUE CROSS%'
-       OR UPPER(V.PARENT_ORGANIZATION) LIKE '%KAISER%'  OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CIGNA%'
-       OR UPPER(V.PARENT_ORGANIZATION) LIKE '%WELLCARE%') THEN 'Large National'
-    WHEN TRY_TO_NUMBER(V.MBR_CNT) > 150000 THEN 'Large - Has Team'
-    WHEN TRY_TO_NUMBER(V.MBR_CNT) > 50000  THEN 'Mid-Size - Maybe'
+# Consulting fit label
+FIT_CASE = """CASE
+    WHEN UPPER(V.PARENT_ORGANIZATION) LIKE '%HUMANA%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%UNITED%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%AETNA%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CVS%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CENTENE%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%MOLINA%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%ANTHEM%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%ELEVANCE%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%BCBS%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%BLUE CROSS%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%KAISER%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%CIGNA%'
+      OR UPPER(V.PARENT_ORGANIZATION) LIKE '%WELLCARE%'
+      THEN 'Large National'
+    WHEN V.MBR_CNT > 150000 THEN 'Large - Has Team'
+    WHEN V.MBR_CNT > 50000  THEN 'Mid-Size - Maybe'
     ELSE 'Small/Regional - TARGET'
 END"""
 
-SYSTEM_CONTEXT = """You are an expert Medicare Advantage consulting analyst for Sadaf, who runs a SMALL BOUTIQUE consulting firm.
+AI_CONTEXT = """You are an expert Medicare Advantage analyst for Sadaf, who runs a SMALL BOUTIQUE consulting firm.
 
-KEY FACTS:
-- Solo/small firm — she can realistically take on 2-5 clients max
-- Target: small/regional MA plans under 50K members with NO in-house analytics team
-- Value prop: star ratings improvement, risk adjustment analytics, compliance strategy
-- NEVER recommend plans owned by: Humana, United, Aetna, CVS, Centene, Molina, Anthem/Elevance, BCBS, Kaiser, Cigna, WellCare
+FIRM PROFILE:
+- Solo/small — can realistically serve 2-5 clients at a time
+- Target: small/regional MA plans (<50K members) with NO in-house analytics team
+- Services: star ratings improvement, risk adjustment analytics, compliance remediation
+- SKIP large national plans (Humana, United, Aetna, CVS, Centene, Molina, Anthem/Elevance, BCBS, Kaiser, Cigna, WellCare)
 
-When answering questions about outreach targets:
-1. Lead with TOP 3 recommendations only (she is small — focus matters)
-2. For each: Plan Name, Contract ID, State, Enrollment, Stars, Contact Name + Email, why they need help
-3. End with a one-line cold outreach email subject line for each
-4. Be direct and actionable — Sadaf has data expertise and wants concrete next steps"""
+CONTACT PRIORITY: CAP letter recipient name/email first → View RECIPIENT_NAME/RECIPIENT_EMAIL → Directory contact
 
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+When asked about outreach:
+1. Recommend TOP 3 plans only — small firm, focus matters
+2. For each: Plan, Contract ID, State, Enrollment, Stars, Contact Name, Email, why they need help
+3. End with a one-line cold outreach email subject for each
+4. Be direct and specific — Sadaf has deep MA analytics expertise"""
+
+# ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🎯 MA Intelligence Hub")
     st.caption("Sadaf's consulting opportunity engine")
     st.divider()
-    st.subheader("Filters")
-    target_only    = st.checkbox("Targets Only (hide large nationals)", value=True)
-    max_enrollment = st.number_input("Max Enrollment", 0, 1000000, 150000, 10000)
+    st.subheader("🔍 Filters")
+    target_only    = st.checkbox("Targets only (hide large nationals)", value=True)
+    max_enroll     = st.number_input("Max Enrollment", 0, 1000000, 150000, 10000)
     cap_only       = st.checkbox("CAP Plans Only")
     lpi_only       = st.checkbox("Low Performers Only")
-    state_list     = st.multiselect("State", ["All","AL","AK","AZ","AR","CA","CO","CT","DE","FL",
+    states         = st.multiselect("State", ["All","AL","AK","AZ","AR","CA","CO","CT","DE","FL",
                                                "GA","HI","ID","IL","IN","IA","KS","KY","LA","ME",
                                                "MD","MA","MI","MN","MS","MO","MT","NE","NV","NH",
                                                "NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI",
                                                "SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"],
                                     default=["All"])
 
-def where_clause():
+def build_where():
     w = []
     if target_only:
-        w.append(LN_FILTER_V)
-    if max_enrollment > 0:
-        w.append(f"TRY_TO_NUMBER(V.MBR_CNT) <= {max_enrollment}")
+        w.append(LN_WHERE_V)
+    if max_enroll > 0:
+        w.append(f"V.MBR_CNT <= {max_enroll}")
     if cap_only:
         w.append("V.Issue_Type IS NOT NULL")
     if lpi_only:
         w.append("V.REASON_FOR_LPI IS NOT NULL")
-    if state_list and "All" not in state_list:
-        s = ",".join([f"'{x}'" for x in state_list])
+    if states and "All" not in states:
+        s = ",".join([f"'{x}'" for x in states])
         w.append(f"V.LEGAL_ENTITY_STATE_CODE IN ({s})")
     return ("WHERE " + " AND ".join(w)) if w else ""
 
-# ── TABS ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(["🎯 Opportunities", "📋 CAP Actions", "⭐ Star Ratings", "🤖 AI Assistant"])
+# ─── TABS ─────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🎯 Opportunities", "📋 CAP Actions", "⭐ Star Ratings", "🤖 AI Assistant"
+])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — OPPORTUNITIES
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.header("🎯 Consulting Opportunities")
-    st.caption("Ranked by opportunity score. CAP contact shown first, then directory contact.")
+    st.caption("Ranked by opportunity score. CAP recipient shown first, then view contact, then directory.")
 
-    wh = where_clause()
+    wh = build_where()
 
-    SQL = f"""
+    OPP_SQL = f"""
     SELECT
         V.CONTRACT_ID,
-        V.ORGANIZATION_MARKETING_NAME                                       AS PLAN_NAME,
+        V.ORGANIZATION_MARKETING_NAME                                           AS PLAN_NAME,
         V.PARENT_ORGANIZATION,
-        V.LEGAL_ENTITY_STATE_CODE                                           AS STATE,
+        V.LEGAL_ENTITY_STATE_CODE                                               AS STATE,
         V.PLAN_TYPE,
-        TRY_TO_NUMBER(V.MBR_CNT)                                           AS ENROLLMENT,
-        V."2026_OVERALL"                                                    AS OVERALL_STARS,
-        V."2026_PART_C_SUMMARY"                                             AS PART_C_STARS,
-        V."2026_PART_D_SUMMARY"                                             AS PART_D_STARS,
+        V.MBR_CNT                                                               AS ENROLLMENT,
+        V."2026_OVERALL"                                                        AS OVERALL_STARS,
+        V."2026_PART_C_SUMMARY"                                                 AS PART_C_STARS,
+        V."2026_PART_D_SUMMARY"                                                 AS PART_D_STARS,
         V.OPPORTUNITY_SCORE,
-        COALESCE(C.RECIPIENT_NAME,     V.Organization_Contact_Name)        AS CONTACT_NAME,
-        COALESCE(C.EMAIL,              V.DIRECTORY_CONTACT_EMAIL)          AS CONTACT_EMAIL,
-        COALESCE(V.Organization_Contact_Phone, V.DIRECTORY_CONTACT_PHONE)  AS CONTACT_PHONE,
+        -- Contact priority: CAP letter → View RECIPIENT → Directory
+        COALESCE(C.RECIPIENT_NAME,
+                 V.RECIPIENT_NAME,
+                 V.DIRECTORY_CONTACT_FIRST_NAME || ' ' || V.DIRECTORY_CONTACT_LAST_NAME)
+                                                                                AS CONTACT_NAME,
+        COALESCE(C.EMAIL,
+                 V.RECIPIENT_EMAIL,
+                 V.DIRECTORY_CONTACT_EMAIL)                                     AS CONTACT_EMAIL,
+        COALESCE(V.Organization_Contact_Phone,
+                 V.DIRECTORY_CONTACT_PHONE)                                     AS CONTACT_PHONE,
+        C.DATE_OF_LETTER                                                        AS CAP_LETTER_DATE,
+        -- Compliance flags
+        COALESCE(C.Issue_Type,  V.Issue_Type)                                  AS CAP_ISSUE_TYPE,
+        COALESCE(C.Issue_Topic, '')                                             AS CAP_ISSUE_TOPIC,
+        COALESCE(C.Issue_Summary, V.Issue_Summary)                             AS CAP_ISSUE_SUMMARY,
         V.REASON_FOR_LPI,
-        V.OVERALL_FAC                                                       AS CAI_FLAG,
-        COALESCE(C.Issue_Type,  V.Issue_Type)                              AS CAP_ISSUE_TYPE,
-        COALESCE(C.Issue_Topic, '')                                         AS CAP_ISSUE_TOPIC,
-        {CONSULTING_FIT_V}                                                  AS CONSULTING_FIT
-    FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
-    LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
-        ON TRIM(V.CONTRACT_ID) = TRIM(C.CONTRACT_ID)
+        V.OVERALL_FAC                                                           AS CAI_FLAG,
+        -- Consulting fit
+        {FIT_CASE}                                                              AS CONSULTING_FIT
+    FROM {V} V
+    LEFT JOIN {C} C
+        ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
     {wh}
-    ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST, TRY_TO_NUMBER(V.MBR_CNT) ASC NULLS LAST
+    ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST, V.MBR_CNT ASC NULLS LAST
     LIMIT 300
     """
 
     c1, c2, c3 = st.columns([2,1,1])
     min_score = c1.slider("Min Opportunity Score", 0, 70, 0, 5)
     show_n    = c2.selectbox("Show top", [25, 50, 100, 200], 0)
-    c3.write("")
     run_opp   = c3.button("🔍 Find Opportunities", type="primary", use_container_width=True)
 
     if run_opp or "opp_df" not in st.session_state:
-        with st.spinner("Loading from Snowflake..."):
+        with st.spinner("Querying Snowflake..."):
             try:
-                df = run_query(SQL)
+                df = run_query(OPP_SQL)
                 if min_score > 0:
                     df = df[pd.to_numeric(df["OPPORTUNITY_SCORE"], errors="coerce") >= min_score]
                 st.session_state["opp_df"] = df.head(show_n)
             except Exception as e:
-                st.error(f"Query error: {e}")
+                st.error(f"Error: {e}")
 
     if "opp_df" in st.session_state:
         df = st.session_state["opp_df"]
@@ -170,52 +218,53 @@ with tab1:
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Plans Found", len(df))
-        m2.metric("Prime Targets", len(targets))
-        m3.metric("Mid-Size Maybe", len(maybe))
+        m2.metric("✅ Prime Targets", len(targets))
+        m3.metric("🟡 Mid-Size", len(maybe))
         scores = pd.to_numeric(df["OPPORTUNITY_SCORE"], errors="coerce")
         m4.metric("Avg Opp Score", f"{scores.mean():.0f}" if scores.notna().any() else "N/A")
 
-        # Table
-        show_cols = ["CONTRACT_ID","PLAN_NAME","STATE","ENROLLMENT","OVERALL_STARS",
-                     "OPPORTUNITY_SCORE","CONSULTING_FIT","CONTACT_NAME","CONTACT_EMAIL",
-                     "CAP_ISSUE_TYPE","REASON_FOR_LPI","CAI_FLAG"]
-        show_cols = [c for c in show_cols if c in df.columns]
-        st.dataframe(df[show_cols], use_container_width=True, height=400)
+        display = ["CONTRACT_ID","PLAN_NAME","STATE","ENROLLMENT","OVERALL_STARS",
+                   "OPPORTUNITY_SCORE","CONSULTING_FIT","CONTACT_NAME","CONTACT_EMAIL",
+                   "CAP_ISSUE_TYPE","REASON_FOR_LPI","CAI_FLAG"]
+        st.dataframe(df[[c for c in display if c in df.columns]],
+                     use_container_width=True, height=420)
 
-        # Detail card
-        st.subheader("📋 Plan Detail Card")
-        selected = st.selectbox("Select plan", df["PLAN_NAME"].tolist(), key="opp_sel")
-        if selected:
-            row = df[df["PLAN_NAME"] == selected].iloc[0]
-            fit = row.get("CONSULTING_FIT","")
-            color = "#e8f5e9" if "TARGET" in fit else "#fff9c4" if "Maybe" in fit else "#ffebee"
-            st.markdown(f"""
-            <div style="background:{color};padding:16px;border-radius:8px;margin-bottom:8px">
-            <h4>{row.get('PLAN_NAME','')} ({row.get('CONTRACT_ID','')})</h4>
-            <b>Parent:</b> {row.get('PARENT_ORGANIZATION','')} &nbsp;|&nbsp;
-            <b>State:</b> {row.get('STATE','')} &nbsp;|&nbsp;
-            <b>Enrollment:</b> {row.get('ENROLLMENT','')} &nbsp;|&nbsp;
-            <b>Fit:</b> {fit}
-            </div>""", unsafe_allow_html=True)
-
+        # Plan detail card
+        st.subheader("📋 Plan Detail")
+        sel = st.selectbox("Select a plan", df["PLAN_NAME"].tolist(), key="opp_sel")
+        if sel:
+            row = df[df["PLAN_NAME"] == sel].iloc[0]
+            fit = row.get("CONSULTING_FIT", "")
+            bg  = "#e8f5e9" if "TARGET" in fit else "#fff9c4" if "Maybe" in fit else "#ffebee"
+            st.markdown(
+                f'<div style="background:{bg};padding:14px;border-radius:8px">'
+                f'<b>{row.get("PLAN_NAME","")} ({row.get("CONTRACT_ID","")})</b> — '
+                f'{row.get("PARENT_ORGANIZATION","")} | {row.get("STATE","")} | '
+                f'Enrollment: {row.get("ENROLLMENT","")} | <b>{fit}</b></div>',
+                unsafe_allow_html=True
+            )
             r1, r2, r3 = st.columns(3)
             with r1:
-                st.markdown("**⭐ Star Ratings**")
-                st.markdown(f"Overall: **{row.get('OVERALL_STARS','N/A')}**")
-                st.markdown(f"Part C: {row.get('PART_C_STARS','N/A')}")
-                st.markdown(f"Part D: {row.get('PART_D_STARS','N/A')}")
-                st.markdown(f"Opp Score: **{row.get('OPPORTUNITY_SCORE','N/A')}**")
+                st.markdown("**⭐ Stars**")
+                st.write(f"Overall: **{row.get('OVERALL_STARS','N/A')}**")
+                st.write(f"Part C: {row.get('PART_C_STARS','N/A')}")
+                st.write(f"Part D: {row.get('PART_D_STARS','N/A')}")
+                st.write(f"Opp Score: **{row.get('OPPORTUNITY_SCORE','N/A')}**")
             with r2:
-                st.markdown("**⚠️ Compliance Flags**")
-                st.markdown(f"CAP Issue: {row.get('CAP_ISSUE_TYPE','None')}")
-                st.markdown(f"CAP Topic: {row.get('CAP_ISSUE_TOPIC','None')}")
-                st.markdown(f"Low Performer: {row.get('REASON_FOR_LPI','No')}")
-                st.markdown(f"CAI Flag: {row.get('CAI_FLAG','No')}")
+                st.markdown("**⚠️ Compliance**")
+                st.write(f"CAP Issue: {row.get('CAP_ISSUE_TYPE','None')}")
+                st.write(f"CAP Topic: {row.get('CAP_ISSUE_TOPIC','None')}")
+                st.write(f"CAP Date: {row.get('CAP_LETTER_DATE','N/A')}")
+                st.write(f"Low Performer: {row.get('REASON_FOR_LPI','No') or 'No'}")
+                st.write(f"CAI Flag: {row.get('CAI_FLAG','No') or 'No'}")
             with r3:
                 st.markdown("**📞 Contact**")
-                st.markdown(f"Name: **{row.get('CONTACT_NAME','N/A')}**")
-                st.markdown(f"Email: {row.get('CONTACT_EMAIL','N/A')}")
-                st.markdown(f"Phone: {row.get('CONTACT_PHONE','N/A')}")
+                st.write(f"Name: **{row.get('CONTACT_NAME','N/A')}**")
+                st.write(f"Email: {row.get('CONTACT_EMAIL','N/A')}")
+                st.write(f"Phone: {row.get('CONTACT_PHONE','N/A')}")
+            if row.get("CAP_ISSUE_SUMMARY"):
+                st.markdown("**CAP Summary:**")
+                st.info(str(row["CAP_ISSUE_SUMMARY"])[:1200])
 
         st.download_button("⬇️ Download CSV", df.to_csv(index=False), "opportunities.csv", "text/csv")
 
@@ -224,25 +273,28 @@ with tab1:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.header("📋 CAP Enforcement Actions")
-    st.caption("CMS corrective actions — these contacts are warm leads for compliance consulting")
+    st.caption("CMS corrective actions — compliance contacts are warm leads for consulting outreach")
 
-    cap_sql = f"""
+    CAP_SQL = f"""
     SELECT
-        C.CONTRACT_ID,
-        C.ORGANIZATION_MARKETING_NAME                   AS PLAN_NAME,
-        C.Parent_Organization_Name                      AS PARENT_ORG,
-        C.LEGAL_ENTITY_STATE_CODE                       AS STATE,
-        TRY_TO_NUMBER(C.MBR_CNT)                       AS ENROLLMENT,
+        C."Contract_ID"                             AS CONTRACT_ID,
+        C.ORGANIZATION_MARKETING_NAME               AS PLAN_NAME,
+        C.Parent_Organization_Name                  AS PARENT_ORG,
+        C.LEGAL_ENTITY_STATE_CODE                   AS STATE,
+        C.PLAN_TYPE,
+        C.MBR_CNT                                   AS ENROLLMENT,
         C.RECIPIENT_NAME,
         C.EMAIL,
+        C.DATE_OF_LETTER,
         C.Issue_Type,
         C.Issue_Topic,
-        V."2026_OVERALL"                                AS OVERALL_STARS,
+        C.Issue_Summary,
+        V."2026_OVERALL"                            AS OVERALL_STARS,
         V.OPPORTUNITY_SCORE,
-        {CONSULTING_FIT_V}                              AS CONSULTING_FIT
-    FROM MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
-    LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
-        ON TRIM(C.CONTRACT_ID) = TRIM(V.CONTRACT_ID)
+        {FIT_CASE}                                  AS CONSULTING_FIT
+    FROM {C} C
+    LEFT JOIN {V} V
+        ON TRIM(C."Contract_ID") = TRIM(V.CONTRACT_ID)
     ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST
     LIMIT 500
     """
@@ -250,41 +302,46 @@ with tab2:
     if st.button("Load CAP Data", type="primary", key="load_cap"):
         with st.spinner("Loading..."):
             try:
-                st.session_state["cap_df"] = run_query(cap_sql)
+                st.session_state["cap_df"] = run_query(CAP_SQL)
             except Exception as e:
                 st.error(f"{e}")
 
     if "cap_df" in st.session_state:
-        cap_df = st.session_state["cap_df"]
+        cdf = st.session_state["cap_df"]
 
         f1, f2 = st.columns(2)
-        it_options = ["All"] + sorted(cap_df["ISSUE_TYPE"].dropna().unique().tolist()) if "ISSUE_TYPE" in cap_df.columns else ["All"]
-        sel_it  = f1.selectbox("Issue Type", it_options)
+        it_opts = ["All"] + sorted(cdf["ISSUE_TYPE"].dropna().unique().tolist()) if "ISSUE_TYPE" in cdf.columns else ["All"]
+        sel_it  = f1.selectbox("Filter Issue Type", it_opts)
         show_ln = f2.checkbox("Show large nationals", value=False)
 
-        view = cap_df.copy()
+        view = cdf.copy()
         if sel_it != "All" and "ISSUE_TYPE" in view.columns:
             view = view[view["ISSUE_TYPE"] == sel_it]
         if not show_ln:
-            for n in LARGE_NATIONALS:
+            for n in LN:
                 view = view[~view["PARENT_ORG"].str.upper().str.contains(n, na=False)]
 
         st.metric("CAP Actions", len(view))
-        show_cap_cols = [c for c in ["CONTRACT_ID","PLAN_NAME","STATE","ENROLLMENT",
-                                      "Issue_Type","Issue_Topic","RECIPIENT_NAME","EMAIL",
-                                      "OVERALL_STARS","CONSULTING_FIT"] if c in view.columns]
-        st.dataframe(view[show_cap_cols], use_container_width=True, height=400)
+        show_c = [c for c in ["CONTRACT_ID","PLAN_NAME","STATE","ENROLLMENT","ISSUE_TYPE",
+                               "RECIPIENT_NAME","EMAIL","DATE_OF_LETTER",
+                               "OVERALL_STARS","CONSULTING_FIT"] if c in view.columns]
+        # Try lowercase too
+        show_c2 = [c for c in ["CONTRACT_ID","PLAN_NAME","STATE","ENROLLMENT","Issue_Type",
+                                "RECIPIENT_NAME","EMAIL","DATE_OF_LETTER",
+                                "OVERALL_STARS","CONSULTING_FIT"] if c in view.columns]
+        st.dataframe(view[show_c2], use_container_width=True, height=400)
 
-        # Detail
         if len(view) > 0:
-            sel = st.selectbox("View full CAP detail", view["CONTRACT_ID"].tolist(), key="cap_sel")
-            rows = cap_df[cap_df["CONTRACT_ID"] == sel]
+            sel_cap = st.selectbox("View full CAP detail", view["CONTRACT_ID"].tolist(), key="cap_sel")
+            rows = cdf[cdf["CONTRACT_ID"] == sel_cap]
             for _, row in rows.iterrows():
-                with st.expander(f"{row.get('PLAN_NAME',sel)} — {row.get('Issue_Type','')}", expanded=True):
+                with st.expander(f"{row.get('PLAN_NAME', sel_cap)} — {row.get('Issue_Type','')}", expanded=True):
                     st.markdown(f"**Contact:** {row.get('RECIPIENT_NAME','N/A')} | {row.get('EMAIL','N/A')}")
-                    st.markdown(f"**Issue:** {row.get('Issue_Topic','N/A')}")
-                    if "Issue_Summary" in row and pd.notna(row["Issue_Summary"]):
-                        st.info(str(row["Issue_Summary"])[:1200])
+                    st.markdown(f"**Date:** {row.get('DATE_OF_LETTER','N/A')}")
+                    st.markdown(f"**Issue Topic:** {row.get('Issue_Topic','N/A')}")
+                    summ = row.get("Issue_Summary","")
+                    if pd.notna(summ) and summ:
+                        st.info(str(summ)[:1500])
 
         st.download_button("⬇️ Download", view.to_csv(index=False), "cap_actions.csv", "text/csv")
 
@@ -294,22 +351,22 @@ with tab2:
 with tab3:
     st.header("⭐ Star Ratings")
 
-    wh3 = where_clause()
-    star_sql = f"""
+    wh3 = build_where()
+    STAR_SQL = f"""
     SELECT
         V.CONTRACT_ID,
         V.ORGANIZATION_MARKETING_NAME   AS PLAN_NAME,
         V.PARENT_ORGANIZATION,
         V.LEGAL_ENTITY_STATE_CODE       AS STATE,
-        TRY_TO_NUMBER(V.MBR_CNT)       AS ENROLLMENT,
+        V.MBR_CNT                       AS ENROLLMENT,
         V."2026_OVERALL"                AS OVERALL_STARS,
         V."2026_PART_C_SUMMARY"         AS PART_C_STARS,
         V."2026_PART_D_SUMMARY"         AS PART_D_STARS,
         V.REASON_FOR_LPI,
         V.OVERALL_FAC                   AS CAI_FLAG,
         V.OPPORTUNITY_SCORE,
-        {CONSULTING_FIT_V}              AS CONSULTING_FIT
-    FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
+        {FIT_CASE}                      AS CONSULTING_FIT
+    FROM {V} V
     {wh3}
     ORDER BY TRY_TO_DECIMAL(V."2026_OVERALL") ASC NULLS LAST
     LIMIT 500
@@ -318,20 +375,20 @@ with tab3:
     if st.button("Load Star Ratings", type="primary", key="load_stars"):
         with st.spinner("Loading..."):
             try:
-                st.session_state["star_df"] = run_query(star_sql)
+                st.session_state["star_df"] = run_query(STAR_SQL)
             except Exception as e:
                 st.error(f"{e}")
 
     if "star_df" in st.session_state:
         sdf = st.session_state["star_df"]
         num = pd.to_numeric(sdf["OVERALL_STARS"], errors="coerce")
-        c1,c2,c3,c4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Plans", len(sdf))
         c2.metric("Below 3.0 ⭐", int((num < 3.0).sum()))
-        c3.metric("3.0-3.4 ⭐", int(((num >= 3.0)&(num < 3.5)).sum()))
+        c3.metric("3.0–3.4 ⭐", int(((num >= 3.0)&(num < 3.5)).sum()))
         c4.metric("4.0+ ⭐", int((num >= 4.0).sum()))
 
-        t1, t2, t3 = st.tabs(["All", "Below 3.0", "4.0+"])
+        t1, t2, t3 = st.tabs(["All Plans", "Below 3.0", "4.0+"])
         with t1:
             st.dataframe(sdf, use_container_width=True, height=400)
         with t2:
@@ -346,108 +403,84 @@ with tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.header("🤖 AI Consulting Assistant")
-    st.caption("Powered by Snowflake Cortex. Knows you run a small boutique firm — gives focused, actionable answers.")
+    st.caption("Powered by Snowflake Cortex + live data. Knows you run a small boutique firm.")
 
+    # Pre-built queries with EXACT column names
     QUICK_SQL = {
-        "Who should I reach out to first?": """
-            SELECT V.CONTRACT_ID, V.ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+        "Who should I reach out to first?": f"""
+            SELECT V.CONTRACT_ID,
+                   V.ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
                    V.PARENT_ORGANIZATION, V.LEGAL_ENTITY_STATE_CODE AS STATE,
-                   TRY_TO_NUMBER(V.MBR_CNT) AS ENROLLMENT,
-                   V."2026_OVERALL" AS OVERALL_STARS, V.OPPORTUNITY_SCORE,
-                   COALESCE(C.RECIPIENT_NAME, V.Organization_Contact_Name) AS CONTACT_NAME,
-                   COALESCE(C.EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL,
-                   COALESCE(C.Issue_Type, V.Issue_Type) AS CAP_ISSUE, V.REASON_FOR_LPI
-            FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
-            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
-                ON TRIM(V.CONTRACT_ID) = TRIM(C.CONTRACT_ID)
-            WHERE TRY_TO_NUMBER(V.MBR_CNT) < 100000
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CVS%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%BLUE CROSS%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CIGNA%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%WELLCARE%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%MOLINA%'
+                   V.MBR_CNT AS ENROLLMENT, V."2026_OVERALL" AS OVERALL_STARS,
+                   V.OPPORTUNITY_SCORE,
+                   COALESCE(C.RECIPIENT_NAME, V.RECIPIENT_NAME,
+                            V.DIRECTORY_CONTACT_FIRST_NAME || ' ' || V.DIRECTORY_CONTACT_LAST_NAME)
+                            AS CONTACT_NAME,
+                   COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL,
+                   COALESCE(C.Issue_Type, V.Issue_Type) AS CAP_ISSUE,
+                   V.REASON_FOR_LPI
+            FROM {V} V
+            LEFT JOIN {C} C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
+            WHERE V.MBR_CNT < 100000
+            AND {LN_WHERE_V}
             ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST LIMIT 10""",
 
-        "Plans with CAP issues and low stars": """
+        "Plans with CAP issues + low stars": f"""
             SELECT V.CONTRACT_ID, V.ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
                    V.PARENT_ORGANIZATION, V.LEGAL_ENTITY_STATE_CODE AS STATE,
-                   TRY_TO_NUMBER(V.MBR_CNT) AS ENROLLMENT,
-                   V."2026_OVERALL" AS OVERALL_STARS, V.OPPORTUNITY_SCORE,
-                   COALESCE(C.RECIPIENT_NAME, V.Organization_Contact_Name) AS CONTACT_NAME,
-                   COALESCE(C.EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL,
-                   COALESCE(C.Issue_Type, V.Issue_Type) AS CAP_ISSUE
-            FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
-            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
-                ON TRIM(V.CONTRACT_ID) = TRIM(C.CONTRACT_ID)
+                   V.MBR_CNT AS ENROLLMENT, V."2026_OVERALL" AS OVERALL_STARS,
+                   V.OPPORTUNITY_SCORE,
+                   COALESCE(C.RECIPIENT_NAME, V.RECIPIENT_NAME) AS CONTACT_NAME,
+                   COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL,
+                   COALESCE(C.Issue_Type, V.Issue_Type) AS CAP_ISSUE,
+                   C.DATE_OF_LETTER AS CAP_DATE
+            FROM {V} V
+            LEFT JOIN {C} C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
             WHERE V.Issue_Type IS NOT NULL
             AND TRY_TO_DECIMAL(V."2026_OVERALL") < 3.5
-            AND TRY_TO_NUMBER(V.MBR_CNT) < 150000
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%HUMANA%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%UNITED%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%AETNA%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CVS%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%CENTENE%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%ANTHEM%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%ELEVANCE%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%BCBS%'
-            AND UPPER(V.PARENT_ORGANIZATION) NOT LIKE '%KAISER%'
+            AND V.MBR_CNT < 150000
+            AND {LN_WHERE_V}
             ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST LIMIT 20""",
 
-        "Small plans below 3 stars": """
+        "Small plans below 3 stars": f"""
             SELECT V.CONTRACT_ID, V.ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
                    V.PARENT_ORGANIZATION, V.LEGAL_ENTITY_STATE_CODE AS STATE,
-                   TRY_TO_NUMBER(V.MBR_CNT) AS ENROLLMENT,
-                   V."2026_OVERALL" AS OVERALL_STARS, V."2026_PART_C_SUMMARY" AS PART_C,
-                   V."2026_PART_D_SUMMARY" AS PART_D, V.OPPORTUNITY_SCORE,
-                   COALESCE(C.RECIPIENT_NAME, V.Organization_Contact_Name) AS CONTACT_NAME,
-                   COALESCE(C.EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL
-            FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
-            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
-                ON TRIM(V.CONTRACT_ID) = TRIM(C.CONTRACT_ID)
+                   V.MBR_CNT AS ENROLLMENT,
+                   V."2026_OVERALL" AS OVERALL_STARS,
+                   V."2026_PART_C_SUMMARY" AS PART_C, V."2026_PART_D_SUMMARY" AS PART_D,
+                   V.OPPORTUNITY_SCORE,
+                   COALESCE(C.RECIPIENT_NAME, V.RECIPIENT_NAME) AS CONTACT_NAME,
+                   COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL
+            FROM {V} V
+            LEFT JOIN {C} C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
             WHERE TRY_TO_DECIMAL(V."2026_OVERALL") < 3.0
-            AND TRY_TO_NUMBER(V.MBR_CNT) < 50000
+            AND V.MBR_CNT < 50000
             ORDER BY TRY_TO_DECIMAL(V."2026_OVERALL") ASC NULLS LAST LIMIT 25""",
 
-        "Low performer plans": """
+        "Low performer plans": f"""
             SELECT V.CONTRACT_ID, V.ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
                    V.PARENT_ORGANIZATION, V.LEGAL_ENTITY_STATE_CODE AS STATE,
-                   TRY_TO_NUMBER(V.MBR_CNT) AS ENROLLMENT,
-                   V."2026_OVERALL" AS OVERALL_STARS, V.REASON_FOR_LPI, V.OPPORTUNITY_SCORE,
-                   COALESCE(C.RECIPIENT_NAME, V.Organization_Contact_Name) AS CONTACT_NAME,
-                   COALESCE(C.EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL
-            FROM MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
-            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
-                ON TRIM(V.CONTRACT_ID) = TRIM(C.CONTRACT_ID)
+                   V.MBR_CNT AS ENROLLMENT, V."2026_OVERALL" AS OVERALL_STARS,
+                   V.REASON_FOR_LPI, V.OPPORTUNITY_SCORE,
+                   COALESCE(C.RECIPIENT_NAME, V.RECIPIENT_NAME) AS CONTACT_NAME,
+                   COALESCE(C.EMAIL, V.RECIPIENT_EMAIL, V.DIRECTORY_CONTACT_EMAIL) AS CONTACT_EMAIL
+            FROM {V} V
+            LEFT JOIN {C} C ON TRIM(V.CONTRACT_ID) = TRIM(C."Contract_ID")
             WHERE V.REASON_FOR_LPI IS NOT NULL
-            ORDER BY TRY_TO_NUMBER(V.MBR_CNT) ASC NULLS LAST LIMIT 25""",
+            ORDER BY V.MBR_CNT ASC NULLS LAST LIMIT 25""",
 
-        "CAP contacts for small independent plans": """
-            SELECT C.CONTRACT_ID, C.ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
+        "CAP contacts — small independent plans": f"""
+            SELECT C."Contract_ID" AS CONTRACT_ID,
+                   C.ORGANIZATION_MARKETING_NAME AS PLAN_NAME,
                    C.Parent_Organization_Name AS PARENT_ORG,
                    C.LEGAL_ENTITY_STATE_CODE AS STATE, C.MBR_CNT AS ENROLLMENT,
-                   C.RECIPIENT_NAME, C.EMAIL, C.Issue_Type, C.Issue_Topic,
+                   C.RECIPIENT_NAME, C.EMAIL, C.DATE_OF_LETTER,
+                   C.Issue_Type, C.Issue_Topic,
                    V."2026_OVERALL" AS OVERALL_STARS, V.OPPORTUNITY_SCORE
-            FROM MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY C
-            LEFT JOIN MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB V
-                ON TRIM(C.CONTRACT_ID) = TRIM(V.CONTRACT_ID)
-            WHERE TRY_TO_NUMBER(C.MBR_CNT) < 100000
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%HUMANA%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%UNITED%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%AETNA%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%CVS%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%CENTENE%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%ANTHEM%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%ELEVANCE%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%BCBS%'
-            AND UPPER(C.Parent_Organization_Name) NOT LIKE '%KAISER%'
+            FROM {C} C
+            LEFT JOIN {V} V ON TRIM(C."Contract_ID") = TRIM(V.CONTRACT_ID)
+            WHERE C.MBR_CNT < 100000
+            AND {LN_WHERE_C}
             AND C.RECIPIENT_NAME IS NOT NULL
             ORDER BY V.OPPORTUNITY_SCORE DESC NULLS LAST LIMIT 30""",
     }
@@ -457,7 +490,6 @@ with tab4:
     if "chat_run" not in st.session_state:
         st.session_state.chat_run = False
 
-    # Quick buttons
     st.subheader("Quick Questions")
     btn_cols = st.columns(3)
     for i, q in enumerate(QUICK_SQL.keys()):
@@ -469,23 +501,21 @@ with tab4:
                 st.rerun()
 
     st.divider()
-    user_q = st.chat_input("Ask anything — e.g. 'who should I call in Florida?' or 'what's my best pitch for UCare?'")
+    user_q = st.chat_input("Ask anything — e.g. 'who should I call in Florida?' or 'what's ATRIO's star rating?'")
     if user_q:
         last = st.session_state.chat_msgs[-1]["content"] if st.session_state.chat_msgs else None
         if not isinstance(last, str) or last != user_q:
             st.session_state.chat_msgs.append({"role": "user", "content": user_q})
             st.session_state.chat_run = True
 
-    # Display history
     for msg in st.session_state.chat_msgs:
-        role = msg["role"] if msg["role"] in ["user","assistant"] else "assistant"
+        role = "user" if msg["role"] == "user" else "assistant"
         with st.chat_message(role):
             if isinstance(msg["content"], pd.DataFrame):
                 st.dataframe(msg["content"], use_container_width=True, height=300)
             else:
                 st.markdown(str(msg["content"]))
 
-    # Process
     if st.session_state.chat_run and st.session_state.chat_msgs:
         st.session_state.chat_run = False
         last_q = st.session_state.chat_msgs[-1]["content"]
@@ -498,7 +528,7 @@ with tab4:
                         if last_q in QUICK_SQL:
                             cur.execute(QUICK_SQL[last_q])
                             cols_ = [c[0] for c in cur.description]
-                            rdf = pd.DataFrame(cur.fetchall(), columns=cols_)
+                            rdf   = pd.DataFrame(cur.fetchall(), columns=cols_)
                             st.success(f"✅ {len(rdf)} results from Snowflake")
                             st.dataframe(rdf, use_container_width=True, height=320)
                             st.session_state.chat_msgs.append({"role":"assistant","content":rdf})
@@ -506,11 +536,13 @@ with tab4:
                             if len(rdf) > 0:
                                 try:
                                     preview = rdf.head(5).to_string(index=False)
-                                    p = f"{SYSTEM_CONTEXT}\n\nQuestion: {last_q}\n\nData:\n{preview}\n\nGive TOP 3 recommendations with contact details and one-line pitch for each. Be specific and actionable."
+                                    p = (f"{AI_CONTEXT}\n\nQuestion: {last_q}\n\n"
+                                         f"Live Snowflake data (top 5):\n{preview}\n\n"
+                                         f"Give TOP 3 recommendations with contact details and one-line pitch per plan.")
                                     p_esc = p.replace("\\","\\\\").replace("'","\\'")
-                                    cur2 = get_cursor()
+                                    cur2  = get_cursor()
                                     cur2.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{p_esc}') AS A")
-                                    raw = cur2.fetchone()[0]
+                                    raw   = cur2.fetchone()[0]
                                     try:
                                         ans = json.loads(raw)["choices"][0]["message"]["content"]
                                     except Exception:
@@ -520,22 +552,35 @@ with tab4:
                                     st.session_state.chat_msgs.append({"role":"assistant","content":"**💡 Action Plan:**\n"+ans})
                                 except Exception:
                                     pass
+
                         else:
                             # AI generates SQL
-                            sp = (f"{SYSTEM_CONTEXT}\n\nGenerate Snowflake SQL for: {last_q}\n\n"
-                                  f"Tables:\n"
-                                  f"1. MA_ANALYTICS.DATA_PROCESSING.VW_MA_INTELLIGENCE_HUB (alias V): "
-                                  f"CONTRACT_ID, ORGANIZATION_MARKETING_NAME, PARENT_ORGANIZATION, MBR_CNT, "
-                                  f"LEGAL_ENTITY_STATE_CODE, PLAN_TYPE, \"2026_OVERALL\", \"2026_PART_C_SUMMARY\", "
-                                  f"\"2026_PART_D_SUMMARY\", REASON_FOR_LPI, OVERALL_FAC, Issue_Type, Issue_Summary, "
-                                  f"Organization_Contact_Name, Organization_Contact_Phone, DIRECTORY_CONTACT_EMAIL, OPPORTUNITY_SCORE\n"
-                                  f"2. MA_ANALYTICS.DATA_PROCESSING.CONTRACTS_CAP_SUMMARY (alias C): "
-                                  f"CONTRACT_ID, ORGANIZATION_MARKETING_NAME, Parent_Organization_Name, "
-                                  f"RECIPIENT_NAME, EMAIL, Issue_Type, Issue_Topic, Issue_Summary, LEGAL_ENTITY_STATE_CODE, MBR_CNT\n"
-                                  f"JOIN ON: TRIM(V.CONTRACT_ID) = TRIM(C.CONTRACT_ID)\n"
-                                  f"NOTE: Quote columns with special chars: \"2026_OVERALL\" etc.\n"
-                                  f"Return ONLY SQL, no markdown, no backticks. LIMIT 25.")
-                            sp_esc = sp.replace("\\","\\\\").replace("'","\\'")
+                            sql_p = (
+                                f"{AI_CONTEXT}\n\n"
+                                f"Generate Snowflake SQL for: {last_q}\n\n"
+                                f"TABLES (use exact column names):\n"
+                                f"1. {V} AS V\n"
+                                f"   Columns: CONTRACT_ID, ORGANIZATION_MARKETING_NAME, PARENT_ORGANIZATION, "
+                                f"MBR_CNT, LEGAL_ENTITY_STATE_CODE, PLAN_TYPE, "
+                                f"RECIPIENT_NAME, RECIPIENT_EMAIL, DATE_OF_LETTER_LATEST, "
+                                f"DIRECTORY_CONTACT_FIRST_NAME, DIRECTORY_CONTACT_LAST_NAME, "
+                                f"DIRECTORY_CONTACT_PHONE, DIRECTORY_CONTACT_EMAIL, "
+                                f"\"2026_OVERALL\", \"2026_PART_C_SUMMARY\", \"2026_PART_D_SUMMARY\", "
+                                f"REASON_FOR_LPI, OVERALL_FAC, PART_C_FAC, PART_D_MAPD_FAC, "
+                                f"Issue_Type, Issue_Summary, Organization_Contact_Name, "
+                                f"Organization_Contact_Phone, OPPORTUNITY_SCORE\n"
+                                f"2. {C} AS C\n"
+                                f"   Columns: \"Contract_ID\" (MIXED CASE - always quote!), "
+                                f"ORGANIZATION_MARKETING_NAME, Parent_Organization_Name, "
+                                f"RECIPIENT_NAME, EMAIL, DATE_OF_LETTER, SUMMARY, FILE_NAME, "
+                                f"Issue_Type, Issue_Topic, Issue_Summary, "
+                                f"LEGAL_ENTITY_STATE_CODE, PLAN_TYPE, MBR_CNT\n\n"
+                                f"JOIN: TRIM(V.CONTRACT_ID) = TRIM(C.\"Contract_ID\")\n"
+                                f"CRITICAL: \"2026_OVERALL\", \"2026_PART_C_SUMMARY\", \"2026_PART_D_SUMMARY\" must be double-quoted\n"
+                                f"CRITICAL: C.\"Contract_ID\" must be double-quoted (mixed case)\n"
+                                f"Return ONLY valid Snowflake SQL. No markdown. No backticks. LIMIT 25."
+                            )
+                            sp_esc = sql_p.replace("\\","\\\\").replace("'","\\'")
                             cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{sp_esc}') AS S")
                             raw_s = cur.fetchone()[0]
                             try:
@@ -547,14 +592,16 @@ with tab4:
                             try:
                                 cur.execute(gen)
                                 cols_ = [c[0] for c in cur.description]
-                                rdf = pd.DataFrame(cur.fetchall(), columns=cols_)
+                                rdf   = pd.DataFrame(cur.fetchall(), columns=cols_)
                                 st.success(f"✅ {len(rdf)} results")
                                 st.dataframe(rdf, use_container_width=True, height=320)
                                 st.session_state.chat_msgs.append({"role":"assistant","content":rdf})
+
                                 if len(rdf) > 0:
                                     try:
                                         preview = rdf.head(5).to_string(index=False)
-                                        ap = f"{SYSTEM_CONTEXT}\n\nQ: {last_q}\n\nData:\n{preview}\n\nGive TOP 3 targets with contact + pitch."
+                                        ap = (f"{AI_CONTEXT}\n\nQ: {last_q}\n\nData:\n{preview}\n\n"
+                                              f"Give TOP 3 targets with contact + one-line pitch each.")
                                         ap_esc = ap.replace("\\","\\\\").replace("'","\\'")
                                         cur3 = get_cursor()
                                         cur3.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{ap_esc}') AS A")
@@ -569,8 +616,9 @@ with tab4:
                                     except Exception:
                                         pass
                             except Exception:
-                                # Fallback
-                                fb = f"{SYSTEM_CONTEXT}\n\nAnswer based on MA knowledge: {last_q}\nBe specific, give top 3 targets."
+                                # Fallback: general knowledge
+                                fb = (f"{AI_CONTEXT}\n\nAnswer from MA expertise: {last_q}\n"
+                                      f"Give TOP 3 specific targets with rationale.")
                                 fb_esc = fb.replace("\\","\\\\").replace("'","\\'")
                                 cur4 = get_cursor()
                                 cur4.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{fb_esc}') AS A")
