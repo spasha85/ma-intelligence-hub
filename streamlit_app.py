@@ -25,9 +25,15 @@ def get_cursor():
         cur.execute("SELECT 1")
         return cur
     except Exception as e:
-        if "390114" in str(e) or "expired" in str(e).lower():
+        err = str(e)
+        if any(code in err for code in ["390114", "394401", "390100"]) or \
+           any(word in err.lower() for word in ["expired", "authentication", "token", "connect"]):
             get_connection.clear()
-            return get_connection().cursor()
+            try:
+                return get_connection().cursor()
+            except Exception:
+                get_connection.clear()
+                return get_connection().cursor()
         raise e
 
 @st.cache_data(ttl=3600)
